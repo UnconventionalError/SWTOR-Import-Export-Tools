@@ -2,8 +2,8 @@
 
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
-    "author": "Darth Atroxa, Crunch, SWTOR Slicers",
-    "version": (5, 0, 2),
+    "author": "Crunch, Darth Atroxa, SWTOR Slicers",
+    "version": (5, 0, 4),
     "blender": (3, 6, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
@@ -92,7 +92,7 @@ def _import_cha(self, _context):
 
 def _import_clo(self, _context):
     # type: (Menu, Context) -> None
-    self.layout.operator(ImportCLO.bl_idname, text="SWTOR 32-bit Cloth Physics (.clo 32-bit) - DO NOT USE!  Read Tooltip")
+    self.layout.operator(ImportCLO.bl_idname, text="SWTOR Cloth Physics (.clo 64-bit) - BETA")
 
 # Exporters
 
@@ -102,7 +102,7 @@ def _export_gr2(self, _context):
 
 def _export_gr2_32(self, _context):
     # type: (Menu, Context) -> None
-    self.layout.operator(ExportGR2_32.bl_idname, text="SWTOR 32-bit Objects (.gr2) - DO NOT USE!  Read Tooltip")
+    self.layout.operator(ExportGR2_32.bl_idname, text="SWTOR 32-bit Objects (.gr2) - BROKEN:  Read Tooltip")
 
 
 class BoneBounds(PropertyGroup):

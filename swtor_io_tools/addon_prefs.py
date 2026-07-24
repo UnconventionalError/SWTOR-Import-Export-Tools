@@ -54,6 +54,12 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    gr2_blender_friendly_skeleton: bpy.props.BoolProperty(
+        name="Blender Friendly Skeleton",
+        description="SKELETON (.gr2) FILES ONLY. Default state of the 'Blender Friendly Skeleton'\noption: normalizes bone roll across the whole skeleton (instead of BioWare's\noriginal, often arbitrary-looking per-bone values), which also fixes X-Mirror\nediting.\n\nWill not work with .jba animations.\n\nDoes not move, resize or reshape any bone.\n\nCan still be switched per-import in the importer's own panel",
+        default=False,
+    )
+
 
     # NPC/Character (.json) import ones:
 
@@ -134,6 +140,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'gr2_import_collision')
         boxcol.prop(self,'gr2_name_as_filename', text="Name Imported Objects As Filenames")
         boxcol.prop(self,'gr2_apply_axis_conversion', text="'Apply' Axis Conversion")
+        boxcol.prop(self,'gr2_blender_friendly_skeleton', text="Blender Friendly Skeleton")
         boxcol.prop(self,'gr2_scale_object', text="Scale Imported Objects/Characters")
         slider_split = boxcol.split(factor=0.1)
         slider_split.enabled = self.gr2_scale_object
