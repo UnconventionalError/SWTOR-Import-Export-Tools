@@ -617,11 +617,11 @@ def build(operator, context, cloth, filepath):
         )
 
     if getattr(operator, "use_spline_ik", False) or getattr(operator, "use_bendy_bones", False):
-        # Kept as its own module: it only needs the FINISHED hierarchy (which unbranched
-        # root-to-leaf paths exist) to decide where to lay a curve and add constraints,
-        # none of the tree-building machinery above -- a genuinely separate concern.
+        # Kept as its own module: it re-derives its own weighted-bone-only hierarchy from
+        # cloth+filepath rather than trusting this function's own effective_parent_of,
+        # since that dict reflects whatever skip_unweighted_bones actually was for this
+        # build -- see import_clo_rig_spline.py's module docstring for why that matters.
         from . import import_clo_rig_spline
-        import_clo_rig_spline.apply(operator, context, armature_ob, effective_parent_of, cloth)
+        import_clo_rig_spline.apply(operator, context, armature_ob, cloth, filepath)
 
     return True
-
