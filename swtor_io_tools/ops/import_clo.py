@@ -97,6 +97,26 @@ class ImportCLO(Operator, ImportHelper):
         description="Not yet implemented -- smooths chain segments, usable with or without Spline IK",
         default=False,
     )
+    add_curve_hooks: BoolProperty(
+        name="Add Hook Controls",
+        description=(
+            "Add an Empty at each spline chain's root and tip, hooked to the curve, for "
+            "quick posing without entering the curve's own Edit Mode. Only applies with "
+            "Add Spline IK enabled"
+        ),
+        default=False,
+    )
+    preserve_bone_length: BoolProperty(
+        name="Preserve Bone Length",
+        description=(
+            "Keep each bone at its original (rest) length instead of stretching to fit "
+            "the curve -- prevents over-stretching the chain when control points are "
+            "moved far apart. Sets Spline IK's Y Scale Mode to 'Bone Original'. A long-"
+            "standing Blender bug (developer.blender.org T77330) means the FIRST bone in "
+            "each chain can still show some residual stretch regardless of this setting"
+        ),
+        default=True,
+    )
     add_master_bone: BoolProperty(
         name="Add Master Bone",
         description=(
@@ -122,6 +142,9 @@ class ImportCLO(Operator, ImportHelper):
             box.label(text="Rig Options")
             box.prop(self, "skip_unweighted_bones")
             box.prop(self, "use_spline_ik")
+            if self.use_spline_ik:
+                box.prop(self, "add_curve_hooks")
+                box.prop(self, "preserve_bone_length")
             box.prop(self, "use_bendy_bones")
             target = context.active_object
             if not (target and target.type == 'ARMATURE'):
