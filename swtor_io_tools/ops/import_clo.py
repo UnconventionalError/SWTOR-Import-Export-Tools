@@ -16,8 +16,9 @@ actual build logic lives in separate modules so this one stays a manageable size
                                   implemented -- see its own module docstring for the
                                   full design notes accumulated building it)
     import_clo_physics.py     -- "Build Cloth Physics": sets up Cloth Physics on the
-                                  matching mesh using the .clo's own pin/stiffness/
-                                  gravity data (not yet implemented)
+                                  SELECTED mesh using the .clo's own pin/stiffness/
+                                  gravity data (colliders not yet implemented -- see
+                                  its own module docstring)
     import_clo_rig_spline.py  -- Spline IK / Bendy Bones layered on top of a built rig
                                   (not yet implemented)
 
@@ -81,6 +82,17 @@ class ImportCLO(Operator, ImportHelper):
             ('PHYSICS', "Build Cloth Physics", "Set up Cloth Physics on the matching mesh using the .clo data"),
         ),
         default='RIG',
+    )
+    physics_auto_fix_floating_islands: BoolProperty(
+        name="Attempt Auto-Fix Floating Vertex Islands",
+        description=(
+            "For mesh pieces (e.g. belt loops, buckles) that carry real cloth data but "
+            "aren't geometrically connected to any pin, force-pin them IF they also have "
+            "real skeleton-bone weight to fall back on (so they'll still follow the body "
+            "via the Armature modifier). Islands with no bone fallback are left alone and "
+            "still reported either way -- this can't guess which bone they should follow"
+        ),
+        default=False,
     )
     skip_unweighted_bones: BoolProperty(
         name="Skip Unweighted Bones",
@@ -152,7 +164,9 @@ class ImportCLO(Operator, ImportHelper):
         else:
             box = layout.box()
             box.label(text="Cloth Physics Options")
-            box.label(text="Not yet implemented", icon='INFO')
+            box.label(text="Applies to the selected mesh (select it first).", icon='INFO')
+            box.label(text="Builds Pin/Stiffness vertex groups + a Cloth modifier.")
+            box.prop(self, "physics_auto_fix_floating_islands")
 
     def execute(self, context):
         # type: (Context) -> Set[str]
