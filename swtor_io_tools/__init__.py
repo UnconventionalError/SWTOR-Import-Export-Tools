@@ -3,7 +3,7 @@
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
     "author": "Crunch, Darth Atroxa, SWTOR Slicers",
-    "version": (5, 0, 6),
+    "version": (5, 0, 7),
     "blender": (3, 6, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
