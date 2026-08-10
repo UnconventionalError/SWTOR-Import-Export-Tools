@@ -21,6 +21,7 @@ import bmesh
 from mathutils import Vector, Matrix
 
 from .import_gr2 import load as ImportGR2_load
+from .shaders_menu import build_swtor_shader_material
 from ..types.shared import job_results
 
 
@@ -153,6 +154,12 @@ def _load_or_get_image(resources_root, relative_path):
     dedup-by-basename convention the original importer used for images --
     distinct from the new dedup-by-.mat-filename convention used for
     materials themselves, see get_or_create_material()).
+
+    Sets alpha_mode/colorspace exactly as the old custom node's per-map
+    update_*Map callbacks did for every SWTOR texture (CHANNEL_PACKED
+    alpha, Non-Color colorspace) -- since assigning an image directly to
+    an external Image Texture node's .image no longer goes through those
+    callbacks, this has to happen here instead.
     """
     path = resolve_resource_path(resources_root, relative_path)
     if not path:
@@ -161,48 +168,140 @@ def _load_or_get_image(resources_root, relative_path):
     existing = bpy.data.images.get(name)
     if existing:
         return existing
-    return bpy.data.images.load(path)
+    image = bpy.data.images.load(path)
+    image.alpha_mode = 'CHANNEL_PACKED'
+    image.colorspace_settings.name = 'Non-Color'
+    return image
 
 
-def _set_palette(node, other_values, index, include_metallic_specular):
-    """Populates a HeroEngine shader node's palette<index>_* properties."""
+def _is_first_pixel_white(image):
+    """
+    True if `image`'s first pixel's Red channel is pure white (1.0),
+    False if pure black (0.0). Raises ValueError otherwise -- SWTOR's
+    Rotation Map opacity-channel background is expected to be exactly
+    one or the other by design, never something in between.
+
+    Used to auto-detect SWTOR's "modernized" head SkinB materials, which
+    use an inverted opacity convention for eyelash detail (black mask on
+    white background) versus the older convention (white mask on black
+    background). A fresh, non-deprecated copy of the original custom
+    node's is_first_pixel_white(), used here as a one-shot check at
+    import time rather than a live-updating callback (see
+    get_or_create_material()'s use of it).
+    """
+    first_red = image.pixels[0]
+    if first_red == 1.0:
+        return True
+    elif first_red == 0.0:
+        return False
+    else:
+        raise ValueError(
+            f"Rotation Map '{image.name}': first pixel's Red channel is "
+            f"neither pure black nor pure white (value={first_red})"
+        )
+
+
+def _get_white_fallback_image():
+    """
+    Matches the old custom node's Complexion Map fallback: a plain white
+    4x4 image, used so SkinB's diffuse*complexion multiply is a no-op
+    when no Complexion Map is present in the json data -- a solid black
+    fallback (what an empty Image Texture node would otherwise output)
+    would multiply the whole diffuse color to black instead.
+    """
+    existing = bpy.data.images.get('white.dds')
+    if existing:
+        return existing
+    image = bpy.data.images.new('white.dds', 4, 4)
+    image.generated_color = [1.0, 1.0, 1.0, 1.0]
+    return image
+
+
+# Default map assets (spec §6 extension, per Crunch): auto-populated into
+# an optional map's Image Texture node when a material's json data doesn't
+# specify that ddsPaths key at all. Keyed by the same json_key used in
+# DERIVED_CONFIGS' "maps" tuples, so this isn't SkinB-specific -- any
+# derived type's optional map can get a default here (e.g. Creature's
+# directionMap) just by adding an entry, no other code changes needed.
+#d
+# Paths are relative to the resources root, same convention as every
+# other ddsPaths entry -- resolve_resource_path() normalizes slashes and
+# strips a redundant leading "resources" segment regardless.
+DEFAULT_MAP_ASSETS = {
+    "complexionMap": "art/defaultassets/white.dds",
+    "facepaintMap": "art/defaultassets/default_facepaint.dds",
+    "ageMap": "art/defaultassets/default_age.dds",
+}
+
+
+def _load_default_map_image(resources_root, json_key):
+    """
+    Loads the fallback image for an optional map key that's absent from
+    a material's json ddsPaths, per DEFAULT_MAP_ASSETS above.
+
+    Returns None -- same as the map simply being absent -- if json_key
+    has no default asset registered, or if its default asset file isn't
+    actually present under resources_root (e.g. Crunch hasn't dropped
+    the defaultassets folder in yet); callers fall back to whatever
+    behavior they had before this existed.
+    """
+    relative_path = DEFAULT_MAP_ASSETS.get(json_key)
+    if relative_path is None:
+        return None
+    try:
+        return _load_or_get_image(resources_root, relative_path)
+    except (OSError, RuntimeError):
+        return None
+
+
+def _set_palette(group_node, other_values, index, include_metallic_specular):
+    """
+    Sets a SWTOR shader group node's Palette<index> input socket
+    defaults (e.g. "Palette1 Hue") -- Koda Shaders' naming convention,
+    adopted across the board per Crunch, including single-palette
+    derived types (Eye/HairC/SkinB), which still get the "Palette1 "
+    prefix despite only having one palette.
+    """
     prefix = "palette%d" % index
+    socket_prefix = f"Palette{index} "
+
     other_palette = other_values[prefix]
-    setattr(node, prefix + "_hue", float(other_palette[0]))
-    setattr(node, prefix + "_saturation", float(other_palette[1]))
-    setattr(node, prefix + "_brightness", float(other_palette[2]))
-    setattr(node, prefix + "_contrast", float(other_palette[3]))
+    group_node.inputs[f'{socket_prefix}Hue'].default_value = float(other_palette[0])
+    group_node.inputs[f'{socket_prefix}Saturation'].default_value = float(other_palette[1])
+    group_node.inputs[f'{socket_prefix}Brightness'].default_value = float(other_palette[2])
+    group_node.inputs[f'{socket_prefix}Contrast'].default_value = float(other_palette[3])
 
     specular = other_values[prefix + "Specular"]
-    setattr(node, prefix + "_specular", [
+    group_node.inputs[f'{socket_prefix}Specular'].default_value = [
         float(specular[0]), float(specular[1]), float(specular[2]), 1.0,
-    ])
+    ]
 
     if include_metallic_specular:
         metallic_specular = other_values[prefix + "MetallicSpecular"]
-        setattr(node, prefix + "_metallic_specular", [
+        group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = [
             float(metallic_specular[0]),
             float(metallic_specular[1]),
             float(metallic_specular[2]),
             1.0,
-        ])
+        ]
 
 
 # Per-derived-type configuration, replacing the original's per-branch node
 # wiring (largely copy-pasted across ~700 lines) with a single data-driven
-# function. Each "maps" tuple is (json ddsPaths key, shader node property,
-# required); required maps are read unconditionally -- same as the
+# function. Each "maps" tuple is (json ddsPaths key, external image node
+# name, required); required maps are read unconditionally -- same as the
 # original, a missing required key raises -- optional maps are only read
-# if present. Each "palettes" tuple is (palette index, include a
-# metallic_specular value too?).
+# if present. Node names match SWTOR_SHADER_GROUPS in shaders_menu.py.
+# Each "palettes" tuple is (palette index, include a metallic_specular
+# value too?).
 DERIVED_CONFIGS = {
     "Creature": {
         "shader_derived": "CREATURE",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
+            ("diffuseMap", "_d", True),
+            ("rotationMap", "_n", True),
+            ("glossMap", "_s", True),
+            ("paletteMaskMap", "_m", True),
             ("directionMap", "directionMap", False),
         ],
         "palettes": [],
@@ -211,23 +310,27 @@ DERIVED_CONFIGS = {
     "Eye": {
         "shader_derived": "EYE",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
+            ("diffuseMap", "_d", True),
+            ("rotationMap", "_n", True),
+            ("glossMap", "_s", True),
+            ("paletteMap", "_h", True),
+            ("paletteMaskMap", "_m", True),
         ],
-        "palettes": [(1, False)],
+        # Metallic Specular was never wired up in the old custom node (a
+        # pre-existing bug, confirmed by Crunch, not intentional) -- now
+        # fixed in eye_group(), so read it from json like every other
+        # single-palette derived type.
+        "palettes": [(1, True)],
         "flesh": False,
     },
     "Garment": {
         "shader_derived": "GARMENT",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
+            ("diffuseMap", "_d", True),
+            ("rotationMap", "_n", True),
+            ("glossMap", "_s", True),
+            ("paletteMap", "_h", True),
+            ("paletteMaskMap", "_m", True),
         ],
         "palettes": [(1, True), (2, True)],
         "flesh": False,
@@ -235,11 +338,11 @@ DERIVED_CONFIGS = {
     "HairC": {
         "shader_derived": "HAIRC",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
+            ("diffuseMap", "_d", True),
+            ("rotationMap", "_n", True),
+            ("glossMap", "_s", True),
+            ("paletteMap", "_h", True),
+            ("paletteMaskMap", "_m", True),
             ("directionMap", "directionMap", True),
         ],
         "palettes": [(1, True)],
@@ -248,14 +351,14 @@ DERIVED_CONFIGS = {
     "SkinB": {
         "shader_derived": "SKINB",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-            ("ageMap", "ageMap", False),
+            ("diffuseMap", "_d", True),
             ("complexionMap", "complexionMap", False),
+            ("rotationMap", "_n", True),
             ("facepaintMap", "facepaintMap", False),
+            ("glossMap", "_s", True),
+            ("ageMap", "ageMap", False),
+            ("paletteMap", "_h", True),
+            ("paletteMaskMap", "_m", True),
         ],
         "palettes": [(1, True)],
         "flesh": True,
@@ -263,9 +366,9 @@ DERIVED_CONFIGS = {
     "Uber": {
         "shader_derived": "UBER",
         "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap", True),
-            ("glossMap", "glossMap", True),
+            ("diffuseMap", "_d", True),
+            ("rotationMap", "_n", True),
+            ("glossMap", "_s", True),
         ],
         "palettes": [],
         "flesh": False,
@@ -274,19 +377,23 @@ DERIVED_CONFIGS = {
 DERIVED_CONFIGS["GarmentScrolling"] = DERIVED_CONFIGS["Garment"]
 
 
-def _has_hero_engine_node(material):
+def _has_swtor_shader_group(material):
     """
-    True if this material already has a ShaderNodeHeroEngine node -- i.e.
-    it was actually built by get_or_create_material() at some point,
-    as opposed to merely existing under this name.
+    True if this material already has one of our native SWTOR shader
+    group nodes -- i.e. it was actually built by get_or_create_material()
+    at some point, as opposed to merely existing under this name.
     """
     if not material.use_nodes or material.node_tree is None:
         return False
-    return any(node.bl_idname == "ShaderNodeHeroEngine" for node in material.node_tree.nodes)
+    return any(
+        node.type == 'GROUP' and node.node_tree is not None
+        and node.node_tree.name.startswith("Atroxa SWTOR - ")
+        for node in material.node_tree.nodes
+    )
 
 
-def get_or_create_material(resources_root, mat_name, derived, mat_info):
-    # type: (str, str, str, Dict[str, Any]) -> Any
+def get_or_create_material(resources_root, mat_name, derived, mat_info, object_name=None):
+    # type: (str, str, str, Dict[str, Any], Optional[str]) -> Any
     """
     Returns a Blender material for the given governing .mat data, (re)
     building its node graph only if it doesn't already have one.
@@ -307,13 +414,21 @@ def get_or_create_material(resources_root, mat_name, derived, mat_info):
     "boot_dancer01_light_ge_a21dancer01_f"), which would collide with
     our own naming/dedup convention. So existence alone isn't a signal
     that a material was actually already built by this function -- only
-    the presence of our own ShaderNodeHeroEngine node is. If a same-named
+    the presence of our own SWTOR shader group node is. If a same-named
     material exists but wasn't built by us, its node graph is rebuilt
     from scratch (rather than ever creating a second, differently-
     suffixed material for the same logical .mat).
+
+    object_name is the Blender Object this material is being assigned to
+    (see import_variant()'s call site) -- only used for SkinB's Rotation
+    Map "head" Invert Alpha auto-detect below. Since materials are
+    deduped by name, this only has an effect the first time a given
+    SkinB material is actually built; a shared material re-assigned to a
+    second, differently-named object afterward keeps whatever Invert
+    Alpha value was baked in the first time.
     """
     new_mat = bpy.data.materials.get(mat_name)
-    if new_mat is not None and _has_hero_engine_node(new_mat):
+    if new_mat is not None and _has_swtor_shader_group(new_mat):
         return new_mat
 
     if new_mat is None:
@@ -334,38 +449,64 @@ def get_or_create_material(resources_root, mat_name, derived, mat_info):
 
     # Clear every existing node (not just the default Principled BSDF --
     # this material may be a gr2-created placeholder we're repurposing,
-    # see docstring above) and rebuild from scratch.
+    # see docstring above) and rebuild from scratch. build_swtor_shader_
+    # material() itself doesn't clear -- see its own docstring -- since
+    # the interactive "Add SWTOR Shader" menu deliberately supports
+    # adding shaders alongside whatever's already in a material.
     for nd in list(new_mat.node_tree.nodes):
         new_mat.node_tree.nodes.remove(nd)
 
-    node = new_mat.node_tree.nodes.new(type="ShaderNodeHeroEngine")
-    node.location = (0.0, 300.0)
-    output = new_mat.node_tree.nodes.new(type="ShaderNodeOutputMaterial")
-    output.location = (300.0, 300.0)
-    new_mat.node_tree.links.new(node.outputs["Shader"], output.inputs["Surface"])
+    group_node, image_nodes = build_swtor_shader_material(new_mat, config["shader_derived"])
 
-    node.derived = config["shader_derived"]
-
-    # Alpha / transparency: unified across every derived type (confirmed:
-    # Blender 4.2 LTS/4.5 LTS only, so no pre-4.2 blend_method branch is
-    # needed, and Creature no longer needs special-cased handling).
-    new_mat.alpha_threshold = node.alpha_test_value = 0.5
+    # Alpha / transparency: unified across every derived type, matching
+    # the original's CLIP-always behavior for json-driven import --
+    # deliberately NOT the per-type OPAQUE-for-Eye/SkinB default that the
+    # interactive "Add SWTOR Shader" menu uses (confirmed with Crunch as
+    # an intentional, pre-existing difference between the two entry
+    # points, not something to unify).
+    new_mat.alpha_threshold = 0.5
     new_mat.show_transparent_back = False
-    node.alpha_mode = 'CLIP'
     new_mat.surface_render_method = "DITHERED"
+    group_node.inputs['Alpha Blend'].default_value = False
+    group_node.inputs['Alpha Test'].default_value = True
+    group_node.inputs['Alpha Test Value'].default_value = 0.5
 
-    for json_key, node_attr, required in config["maps"]:
+    for json_key, node_name, required in config["maps"]:
         if required or json_key in dds_paths:
             image = _load_or_get_image(resources_root, dds_paths[json_key])
-            setattr(node, node_attr, image)
+            image_nodes[node_name].image = image
+        else:
+            default_image = _load_default_map_image(resources_root, json_key)
+            if default_image is not None:
+                image_nodes[node_name].image = default_image
+            elif node_name == 'complexionMap':
+                # Last-resort fallback, kept from the original custom
+                # node's behavior: Complexion Color feeds a multiply
+                # against diffuse, so an empty Image Texture node's
+                # black default would render the whole material black
+                # instead of leaving diffuse unchanged. Only reached if
+                # DEFAULT_MAP_ASSETS' own white.dds isn't present under
+                # resources_root either.
+                image_nodes[node_name].image = _get_white_fallback_image()
 
+    # SkinB head materials: auto-detect Invert Alpha from the Rotation
+    # Map's own pixel data, matching the original custom node's behavior.
+    # A one-shot bake at import time rather than a live callback -- see
+    # this function's docstring re: object_name.
+    if derived == "SkinB" and object_name and "head" in object_name.lower():
+        rotation_image = image_nodes['_n'].image
+        if rotation_image is not None:
+            group_node.inputs['Invert Alpha'].default_value = _is_first_pixel_white(rotation_image)
+
+    # Every derived type feeds "Palette<N> Hue"/"Saturation"/... sockets
+    # (Koda Shaders' convention) -- Garment is the only one with two.
     for palette_index, include_metallic_specular in config["palettes"]:
-        _set_palette(node, other_values, palette_index, include_metallic_specular)
+        _set_palette(group_node, other_values, palette_index, include_metallic_specular)
 
     if config["flesh"]:
-        node.flesh_brightness = float(other_values["fleshBrightness"])
+        group_node.inputs['Flesh Brightness'].default_value = float(other_values["fleshBrightness"])
         flush = other_values["flush"]
-        node.flush_tone = [float(flush[0]), float(flush[1]), float(flush[2]), 1.0]
+        group_node.inputs['Flush Tone'].default_value = [float(flush[0]), float(flush[1]), float(flush[2]), 1.0]
 
     return new_mat
 
@@ -519,7 +660,7 @@ def import_variant(operator, context, resources_root, entry, skin_mats):
 
                 mat_name = Path(mat_path).stem
                 material = get_or_create_material(
-                    resources_root, mat_name, derived, mat_info,
+                    resources_root, mat_name, derived, mat_info, object_name=ob.name,
                 )
                 ob.material_slots[index].material = material
 

@@ -3,8 +3,8 @@
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
     "author": "Crunch, Darth Atroxa, SWTOR Slicers",
-    "version": (5, 0, 7),
-    "blender": (3, 6, 0),
+    "version": (5, 1, 0),
+    "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
     "support": 'COMMUNITY',
@@ -27,21 +27,42 @@ from bpy.types import Context, KeyMap, Menu, PropertyGroup
 from .addon_prefs import Prefs
 
 from .ops.export_gr2             import ExportGR2
-from .ops.export_gr2_32          import ExportGR2_32
 from .ops.import_gr2             import ImportGR2
 from .ops.import_cha             import ImportCHA
 from .ops.import_clo             import ImportCLO
 from .ops.import_jba             import ImportJBA
 
-from .types.node        import ShaderNodeHeroEngine, NODE_OT_ngroup_edit
+from .types.node         import NODE_OT_ngroup_edit
+from .ops.shaders_menu    import *  # classes and fn for Shader Editor's Add menu functionality
 
-# Detect Blender version
-major, minor, _ = bpy.app.version
-blender_version = float(f"{major}.{minor}")
-
-
-if blender_version >= 4.0:
-    from .ops.add_swtor_shaders_menu import *  # classes and fn for Shader Editor's Add menu functionality in 4.x
+# ============================================================================
+# DEPRECATED SYSTEM -- ShaderNodeHeroEngine custom-node shaders
+#
+# Everything imported here (and everything added to deprecated_classes,
+# plus the two DEPRECATED-marked blocks further down in register()/
+# unregister()) supports the addon's original custom-Python-node shader
+# system, superseded by the native node-group shaders in .ops.shaders_menu.
+#
+# TO DROP SUPPORT: delete this import block, the deprecated_classes tuple
+# and everywhere it's used below, plus these four files:
+#   - types/node_deprecated.py
+#   - types/node_tree_deprecated.py
+#   - ops/shaders_menu_deprecated.py
+#   - ops/migrate_shaders.py (reads ShaderNodeHeroEngine instances that
+#     only exist because of this system -- nothing left to migrate FROM
+#     once it's gone)
+# ============================================================================
+from .types.node_deprecated import ShaderNodeHeroEngine
+from .ops.shaders_menu_deprecated import *
+from .ops.migrate_shaders import (
+    SWTOR_OT_migrate_shader,
+    SWTOR_OT_migrate_shaders_selected,
+    SWTOR_OT_migrate_shaders_file,
+    swtor_migrate_submenu_element,
+)
+# ============================================================================
+# END DEPRECATED SYSTEM imports
+# ============================================================================
 
 
 
@@ -98,11 +119,7 @@ def _import_clo(self, _context):
 
 def _export_gr2(self, _context):
     # type: (Menu, Context) -> None
-    self.layout.operator(ExportGR2.bl_idname, text="SWTOR 64-bit Objects (.gr2) - BETA:  Read Tooltip")
-
-def _export_gr2_32(self, _context):
-    # type: (Menu, Context) -> None
-    self.layout.operator(ExportGR2_32.bl_idname, text="SWTOR 32-bit Objects (.gr2) - BROKEN:  Read Tooltip")
+    self.layout.operator(ExportGR2.bl_idname, text="SWTOR Objects (.gr2) - BETA:  Read Tooltip")
 
 
 class BoneBounds(PropertyGroup):
@@ -113,16 +130,32 @@ classes = (
     Prefs,
     BoneBounds,
     ExportGR2,
-    ExportGR2_32,
     ImportCHA,
     ImportCLO,
     ImportGR2,
     ImportJBA,
-    ShaderNodeHeroEngine,
     NODE_OT_ngroup_edit,
+    NODE_MT_swtor_shaders_menu,
+    NODE_OT_add_swtor_shader_group,
 )
-if blender_version >= 4.0:
-    classes = classes + (NODE_MT_add_swtor_shader, NODE_MT_swtor_shaders_menu)
+
+# ============================================================================
+# DEPRECATED SYSTEM -- see the import block near the top of this file for
+# what to delete when dropping support.
+# ============================================================================
+deprecated_classes = (
+    ShaderNodeHeroEngine,
+    NODE_MT_add_swtor_shader,
+    NODE_MT_swtor_shaders_menu_deprecated,
+    # Migration bridge -- searchable (F3) standard operators, no menu
+    # entries by design; see ops/migrate_shaders.py.
+    SWTOR_OT_migrate_shader,
+    SWTOR_OT_migrate_shaders_selected,
+    SWTOR_OT_migrate_shaders_file,
+)
+# ============================================================================
+# END DEPRECATED SYSTEM classes
+# ============================================================================
 
 keymaps: List[KeyMap] = []
 
@@ -134,6 +167,8 @@ def register():
     from bpy.utils import register_class
     for cls in classes:
         register_class(cls)
+    for cls in deprecated_classes:  # DEPRECATED SYSTEM
+        register_class(cls)
 
 
     # Additions to Import-Export menu
@@ -144,7 +179,6 @@ def register():
     TOPBAR_MT_file_import.append(_import_clo)
     
     TOPBAR_MT_file_export.append(_export_gr2)
-    TOPBAR_MT_file_export.append(_export_gr2_32)
 
 
     from bpy.props import CollectionProperty
@@ -161,23 +195,14 @@ def register():
     
     
     # Additions to Shader Editor's Add menu
-    if blender_version < 4.0:
-        from .types import node
+    from .types import node
+    bpy.types.NODE_MT_add.append(swtor_shaders_submenu_element)
+    bpy.types.NODE_MT_add.append(swtor_shaders_submenu_element_deprecated)  # DEPRECATED SYSTEM
 
-        # This was the specific way to extend shader menu categories
-        # that has been deprecated in 4.x.
-        # (Oddly enough, it seems it was deprecated in 3.4
-        # but still it works in 3.6.x ?)
-        from nodeitems_utils import register_node_categories
-        register_node_categories('SWTOR', node.node_categories)
-
-    else:
-        
-        from .types import node
-        
-        # Appends fn with separator bar plus SWTOR menu to the Shader Editor's Add menu
-        # This is a conventional way to extend menus.
-        bpy.types.NODE_MT_add.append(swtor_shaders_submenu_element)
+    # Migration entries -- appended onto the deprecated submenu itself
+    # (not NODE_MT_add), split off with a separator from its six
+    # "Add SWTOR Shader" entries. See ops/migrate_shaders.py.
+    NODE_MT_swtor_shaders_menu_deprecated.append(swtor_migrate_submenu_element)  # DEPRECATED SYSTEM
 
 
     # TAB-into-Nodegroup functionality
@@ -191,11 +216,9 @@ def register():
 
 
 def unregister():
-    if blender_version < 4.0:
-        from nodeitems_utils import unregister_node_categories
-        unregister_node_categories('SWTOR')
-    else:
-        bpy.types.NODE_MT_add.remove(swtor_shaders_submenu_element)
+    NODE_MT_swtor_shaders_menu_deprecated.remove(swtor_migrate_submenu_element)  # DEPRECATED SYSTEM
+    bpy.types.NODE_MT_add.remove(swtor_shaders_submenu_element_deprecated)  # DEPRECATED SYSTEM
+    bpy.types.NODE_MT_add.remove(swtor_shaders_submenu_element)
 
     # type: () -> None
     for km in keymaps:
@@ -209,9 +232,10 @@ def unregister():
     TOPBAR_MT_file_import.remove(_import_gr2)
     TOPBAR_MT_file_import.remove(_import_jba)
     TOPBAR_MT_file_export.remove(_export_gr2)
-    TOPBAR_MT_file_export.remove(_export_gr2_32)
 
     from bpy.utils import unregister_class
+    for cls in deprecated_classes:  # DEPRECATED SYSTEM
+        unregister_class(cls)
     for cls in classes:
         unregister_class(cls)
         

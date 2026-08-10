@@ -371,7 +371,13 @@ def build(operator, context, cloth, filepath):
         # Matches this add-on's .gr2 importer: when it "applies" axis conversion, the
         # rotation gets baked into the edit-bone data itself instead of living on the
         # object, so our raw (un-rotated) positions need the same bake to line up.
-        bake_rotation = bool(armature_ob.get("gr2_axis_conversion", False))
+        # "gr2_axis_conversion" was the old name for this property before it was
+        # renamed to "import_axis_conversion"; fall back to it for objects imported
+        # with older addon versions.
+        if "import_axis_conversion" in armature_ob:
+            bake_rotation = bool(armature_ob["import_axis_conversion"])
+        else:
+            bake_rotation = bool(armature_ob.get("gr2_axis_conversion", False))  # legacy key, pre-rename
         created_new = False
     else:
         armature_data = bpy.data.armatures.new(os.path.splitext(os.path.basename(filepath))[0] + "_skeleton")
@@ -604,10 +610,10 @@ def build(operator, context, cloth, filepath):
 
     if created_new:
         armature_ob.matrix_local = AXIS_CONVERSION_ROTATION
-        armature_ob["gr2_axis_conversion"] = False
+        armature_ob["import_axis_conversion"] = False
         armature_ob.data.display_type = 'STICK'
         armature_ob.scale *= scale_factor
-        armature_ob["gr2_scale"] = scale_factor
+        armature_ob["import_scale"] = scale_factor
 
     if skipped_existing:
         operator.report(

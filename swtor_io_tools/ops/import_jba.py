@@ -363,7 +363,14 @@ def build(operator, context, filepath, jba):
     # Check if the armature object has import scale custom property data.
     # If not, use scale_animation and scale_factor or the add-on's prefs
     # settings for the .gr2 import.
-    if 'gr2_scale' in ob:
+    # "gr2_scale" was the old name for this property before it was renamed to
+    # "import_scale" to disambiguate from the newer gr2_* BWAG-format round-trip
+    # properties. Objects imported with older addon versions still carry the old
+    # key, so we fall back to it rather than silently recalculating a (possibly
+    # different) scale for those objects.
+    if 'import_scale' in ob:
+        scale = 1000 * (1 / ob['import_scale'])
+    elif 'gr2_scale' in ob:  # legacy key, pre-rename
         scale = 1000 * (1 / ob['gr2_scale'])
     else:
         if operator.scale_animation:

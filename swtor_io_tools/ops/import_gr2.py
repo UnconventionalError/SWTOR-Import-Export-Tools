@@ -151,7 +151,7 @@ class ImportGR2(Operator):
 
     enforce_neutral_settings: BoolProperty(
         name="Enforce Neutral Settings",
-        description="Temporarily overrides this Add-on's settings\with those of older versions for compatibility with older tools",
+        description="Temporarily overrides this Add-on's settings\nwith those of older versions for compatibility with older tools",
         options={'HIDDEN'},
         default=False,
     )
@@ -255,6 +255,8 @@ def read(operator, filepath):
 
     gr2.version = dv.getUint32(pos, 1)                   # GR2 file version
 
+    pos = 12  # 0x0C
+    gr2.offset_BNRY = dv.getUint32(pos, 1)                # Offset of the appended BNRY/collision blob, or 0
 
     pos = 20  # 0x14, skipping the version numbers, magic numbers and collision offset
 
@@ -267,8 +269,10 @@ def read(operator, filepath):
     pos += 2
     num_bones = dv.getUint16(pos, 1)                     # Number of bones in this file
     pos += 2
+    num_attachment_bones = dv.getUint16(pos, 1)          # Number of attachment bones in this file
+    pos += 2
 
-    pos += 18
+    pos += 16
 
     # gr2.bounds = Granny2.BoundingBox([dv.getFloat32(pos + (i * 4), 1) for i in range(8)])
     pos += 32
@@ -278,6 +282,7 @@ def read(operator, filepath):
     offset_mesh_header = None
     offset_material_name_offsets = None
     offset_bone_struct = None
+    offset_attachment_bones = None
     # 0x50
     # skipping offset CachedOffset as we don't use it
     if gr2.version == 5:
@@ -288,6 +293,8 @@ def read(operator, filepath):
         pos += 8
         offset_bone_struct = dv.getUint64(pos, 1)            # Bone structure offset address
         pos += 8
+        offset_attachment_bones = dv.getUint64(pos, 1)       # Attachment bone table offset address
+        pos += 8
     else:	
         pos += 4  # 0x54
         offset_mesh_header = dv.getUint32(pos, 1)            # Mesh header offset address
@@ -295,6 +302,8 @@ def read(operator, filepath):
         offset_material_name_offsets = dv.getUint32(pos, 1)  # Material header offset address
         pos += 4
         offset_bone_struct = dv.getUint32(pos, 1)            # Bone structure offset address
+        pos += 4
+        offset_attachment_bones = dv.getUint32(pos, 1)       # Attachment bone table offset address
         pos += 4
 
 
@@ -321,8 +330,12 @@ def read(operator, filepath):
         
         # operator.report({'INFO'}, f"Read the header for mesh {mesh.name}... {pos}")  # for diagnostics
 
-        # BitFlag1
-        pos += 4
+        # LOD (FFFF = generated_collision, FFFD = occluder, 0000 = normal, 0002+ = LOD level)
+        mesh.lod = dv.getInt16(pos, 1)
+        pos += 2
+        # BitFlag1 (0x2000 = collision, 0x8000 = static)
+        mesh.raw_bit_flag1 = dv.getUint16(pos, 1)
+        pos += 2
         # Number of sub meshes that make up this mesh
         num_pieces = dv.getUint16(pos, 1)
         pos += 2
@@ -483,6 +496,62 @@ def read(operator, filepath):
     gr2.bone_buffer = {i: Granny2.Bone(dv, offset_bone_struct + (i * bone_size_of_mem), gr2.version)
                        for i in range(num_bones)}
 
+    # Attachment bones (VFX/socket points, e.g. weapon or muzzle attach points).
+    # These only ever occur in mesh/geometry files, never in skeleton files, and are
+    # not (yet) represented in Blender beyond round-trip storage on export objects
+    # (see swtor_attachment_bones custom property in build()).
+    gr2.attachment_bones = []
+    if num_attachment_bones > 0 and offset_attachment_bones:
+        pos = offset_attachment_bones
+        for _ in range(num_attachment_bones):
+            if gr2.version == 5:
+                name_offset = dv.getUint64(pos, 1)
+                pos += 8
+                bone_name_offset = dv.getUint64(pos, 1)
+                pos += 8
+            else:
+                name_offset = dv.getUint32(pos, 1)
+                pos += 4
+                bone_name_offset = dv.getUint32(pos, 1)
+                pos += 4
+
+            attachment_name = readString(dv, name_offset, posOverride=name_offset)
+            attachment_bone_name = readString(dv, bone_name_offset, posOverride=bone_name_offset)
+            matrix = [dv.getFloat32(pos + (k * 4), 1) for k in range(16)]
+            pos += 64
+
+            gr2.attachment_bones.append({
+                "name": attachment_name,
+                "bone": attachment_bone_name,
+                "matrix": matrix,
+            })
+
+    # BNRY (embedded collision) summary. We deliberately do NOT cache the raw blob
+    # bytes here -- meshes get edited, and a stale byte-perfect passthrough would be
+    # actively misleading. This is just enough to let the exporter (or a future
+    # validation step) warn that a cached collision reference exists and may now be
+    # out of date. Full BNRY read/regeneration is a separate, later task.
+    gr2.bnry_summary = None
+    if gr2.offset_BNRY and gr2.offset_BNRY < dv.byteLength:
+        bnry_length = dv.getUint32(gr2.offset_BNRY, 1)
+        if bnry_length != 0:
+            pos = gr2.offset_BNRY + 8  # skip bnryLength (4) + "BNRY" magic (4)
+            pos += 4  # skip big-endian version word (always 2)
+            pos += 4  # skip "LTLE" marker
+            pos += 8  # skip const1 (always 1), const2 (always 2)
+            num_pieces = dv.getUint32(pos, 1)
+            pos += 8  # skip numPieces (just read) + runtimeTotalBytes
+            num_bih_nodes = dv.getUint32(pos, 1)
+            pos += 4  # skip numBihNodes (just read)
+            num_triangles = dv.getUint32(pos, 1)
+
+            gr2.bnry_summary = {
+                "bnryLength": bnry_length,
+                "numPieces": num_pieces,
+                "numBihNodes": num_bih_nodes,
+                "numTriangles": num_triangles,
+            }
+
     return gr2
 
 def build(gr2,
@@ -523,12 +592,19 @@ def build(gr2,
                           [],
                           [index for index in mesh.indices_buffer.values()])
         
+        # Original (file-exact) material names in slot order. Blender renames
+        # data-blocks on name collision (e.g. a second "default" material becomes
+        # "default.001"), which is common across SWTOR assets, so this is captured
+        # separately rather than trusted to bpy.data.materials[...].name later.
+        original_material_names = []
+
         if mesh.bit_flag2 & 32:  # 0x20
             # Link Materials
             material_indices = []
             for j, piece in mesh.piece_header_buffer.items():
                 material = gr2.material_names[j if piece.material_index == 4294967295 else piece.material_index]
                 blend_mesh.materials.append(bpy.data.materials[material])
+                original_material_names.append(material)
 
                 for _ in range(piece.num_polygons):
                     material_indices.append(j)
@@ -666,6 +742,24 @@ def build(gr2,
 
         resulting_single_mesh_blender_objects.append(ob.name)
 
+        # --- Round-trip data, for the exporter to read/compare/verify later ---
+        # Named gr2_* since these are BWAG file-format data specifically (see
+        # import_scale / import_axis_conversion below for the separate convention
+        # used by importer-override properties).
+        # Per-mesh: values Blender has no native slot for, or that Blender's own
+        # naming rules could silently corrupt before export.
+        ob["gr2_original_name"] = mesh.original_name
+        ob["gr2_material_names"] = json.dumps(original_material_names)
+        ob["gr2_lod"] = mesh.lod
+        ob["gr2_bit_flag1"] = mesh.raw_bit_flag1
+        # File-level: replicated onto every sibling object produced from this same
+        # source file, since the exporter operates per-object (one object = one
+        # exported .gr2), and any one of them might be the one selected for export.
+        ob["gr2_type_flag"] = gr2.type_flag
+        ob["gr2_attachment_bones"] = json.dumps(gr2.attachment_bones)
+        if gr2.bnry_summary is not None:
+            ob["gr2_bnry_summary"] = json.dumps(gr2.bnry_summary)
+
 
         # Create Vertex Groups
         for bone in mesh.bone_buffer.values():
@@ -700,8 +794,8 @@ def build(gr2,
                 
             bpy.ops.object.transform_apply(location=False, rotation=apply_axis_conversion, scale=scale_object, properties=True)
             
-        ob["gr2_scale"] = scale_factor
-        ob["gr2_axis_conversion"] = apply_axis_conversion
+        ob["import_scale"] = scale_factor
+        ob["import_axis_conversion"] = apply_axis_conversion
             
 
 
@@ -822,15 +916,23 @@ def build(gr2,
         bpy.context.object.name = armature.name
         resulting_single_mesh_blender_objects.append(bpy.context.object.name)
 
+        # File-level round-trip data (see mesh objects above for the full explanation).
+        # Only file-level properties apply here -- an armature has no per-mesh
+        # material/lod/bitflag data of its own.
+        bpy.context.object["gr2_type_flag"] = gr2.type_flag
+        bpy.context.object["gr2_attachment_bones"] = json.dumps(gr2.attachment_bones)
+        if gr2.bnry_summary is not None:
+            bpy.context.object["gr2_bnry_summary"] = json.dumps(gr2.bnry_summary)
+
         bpy.context.object.matrix_local = Matrix.Rotation(PI * 0.5, 4, 'X')
         
         # Apply transformation options and record them
         # in custom object properties 
         if scale_object:
             bpy.context.object.scale *= scale_factor
-            bpy.context.object["gr2_scale"] = scale_factor
+            bpy.context.object["import_scale"] = scale_factor
         else:
-            bpy.context.object["gr2_scale"] = 1.0
+            bpy.context.object["import_scale"] = 1.0
 
         bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -840,10 +942,10 @@ def build(gr2,
             ob.select_set(True)
             bpy.context.view_layer.objects.active = ob
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=scale_object, properties=True )
-            ob["gr2_axis_conversion"] = True
+            ob["import_axis_conversion"] = True
         else:
             ob=bpy.data.objects[armature.name]
-            ob["gr2_axis_conversion"] = False
+            ob["import_axis_conversion"] = False
 
         
     return resulting_single_mesh_blender_objects

@@ -737,6 +737,66 @@ def convert_hsl_to_rgb():
     return node_tree
 
 
+def direction_map_uv():
+    # type: () -> NodeTree
+    """
+    Computes the sample vector used to drive a Direction Map's Vector
+    input, from a Rotation Map's Color/Alpha. Wraps
+    NormalAndAlphaFromSwizzledTexture -> Normal Map -> GetSpecularLookup
+    into a single reusable group, tagged Color Tag = Vector.
+
+    Used by Creature and HairC, outside their main shader group -- a
+    Direction Map's Vector can't be sourced from inside that group
+    without Blender rejecting the connection as a dependency cycle
+    (external node depending on the group, group depending back on it).
+
+    Group name kept as "DirectionMapUV" per Crunch; its own input socket
+    names ('_n RotationMap1 Color'/'Alpha') were renamed to match the
+    RotationMap1 convention adopted elsewhere -- tangentN's internal
+    sub-group interface (normal_and_alpha_from_swizzled_texture) is
+    untouched, still '_n RotationMap Color'/'Alpha'.
+    """
+    # Check if node tree already exists
+    if 'DirectionMapUV' in bpy.data.node_groups:
+        return bpy.data.node_groups['DirectionMapUV']
+
+    node_tree = bpy.data.node_groups.new(name='DirectionMapUV', type='ShaderNodeTree')
+    node_tree.color_tag = 'VECTOR'
+
+    node_tree.interface.new_socket('_n RotationMap1 Color', in_out='INPUT', socket_type='NodeSocketColor')
+    node_tree.interface.new_socket('_n RotationMap1 Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
+    node_tree.interface.new_socket('Vector', in_out='OUTPUT', socket_type='NodeSocketVector')
+
+    grpIn = node_tree.nodes.new(type='NodeGroupInput')
+    grpIn.location = (-700.0, 0.0)
+
+    tangentN = node_tree.nodes.new(type='ShaderNodeGroup')
+    tangentN.location = (-440.0, 0.0)
+    tangentN.name = "tangentN"
+    tangentN.node_tree = normal_and_alpha_from_swizzled_texture()
+    tangentN.width = 260.0
+
+    norMap = node_tree.nodes.new(type='ShaderNodeNormalMap')
+    norMap.location = (-160.0, 0.0)
+
+    specLookup = node_tree.nodes.new(type='ShaderNodeGroup')
+    specLookup.location = (80.0, 0.0)
+    specLookup.name = "hair"
+    specLookup.node_tree = get_specular_lookup()
+    specLookup.width = 200.0
+
+    grpOut = node_tree.nodes.new(type='NodeGroupOutput')
+    grpOut.location = (320.0, 0.0)
+
+    node_tree.links.new(grpIn.outputs['_n RotationMap1 Color'], tangentN.inputs['_n RotationMap Color'])
+    node_tree.links.new(grpIn.outputs['_n RotationMap1 Alpha'], tangentN.inputs['_n RotationMap Alpha'])
+    node_tree.links.new(tangentN.outputs['Normal'], norMap.inputs['Color'])
+    node_tree.links.new(norMap.outputs['Normal'], specLookup.inputs['Normal'])
+    node_tree.links.new(specLookup.outputs['Vector'], grpOut.inputs['Vector'])
+
+    return node_tree
+
+
 def expand_hsl():
     # type: () -> NodeTree
     """
