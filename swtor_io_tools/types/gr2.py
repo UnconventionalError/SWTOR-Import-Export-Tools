@@ -14,7 +14,8 @@ class Granny2:
 
     __slots__ = ("offset_BNRY", "type_flag", "bounds", "offset_cached_offsets",
                  "offset_mesh_headers", "offset_material_name_offsets", "mesh_buffer",
-                 "bone_buffer", "material_names", "num_bytes", "version")
+                 "bone_buffer", "material_names", "num_bytes", "version",
+                 "attachment_bones", "bnry_summary", "offset_attachment_bones")
 
     class Bone:
         """
@@ -137,7 +138,8 @@ class Granny2:
 
         __slots__ = ("_mesh_name", "bone_buffer", "indices_buffer", "offset_bones_buffer",
                      "offset_indices_buffer", "offset_mesh_name", "offset_piece_headers",
-                     "offset_vertex_buffer", "piece_header_buffer", "vertex_buffer")
+                     "offset_vertex_buffer", "piece_header_buffer", "vertex_buffer",
+                     "lod", "raw_bit_flag1")
 
         bone_buffer:         Dict[int, "Granny2.Bone"]
         indices_buffer:      Dict[int, Tuple[int]]
@@ -168,8 +170,25 @@ class Granny2:
                 return "None"
 
         @property
+        def original_name(self):
+            # type: () -> str
+            # Raw name exactly as read from the file, before the Blender-friendly
+            # space-to-underscore substitution done by `name`. Stored on export
+            # objects as `swtor_original_name` so exports survive Blender renaming
+            # the object/mesh data-block on collision (e.g. "Name.001").
+            return getattr(self, "_mesh_name", None) or "None"
+
+        @property
         def bit_flag1(self):           # 0x74 Uint32
             # type: () -> int
+            # Prefer the real captured value (set by the exporter's parse()
+            # from gr2_bit_flag1, or by the importer's read()) over the
+            # heuristic below, which only ever guessed "static-ish" vs
+            # "skinned" and knew nothing of the real collision (0x2000) /
+            # static (0x8000) bits.
+            override = getattr(self, "raw_bit_flag1", None)
+            if override is not None:
+                return override
             return 0 if getattr(self, "bone_buffer", None) else 128
 
         @property
@@ -310,6 +329,8 @@ class Granny2:
             for mesh in self.mesh_buffer.values():
                 if getattr(mesh, "bone_buffer", None):
                     count += mesh.num_used_bones
+        # 2 pointer entries per attachment bone (name, parent bone name)
+        count += 2 * self.num_attachments
         return count
 
     @property
@@ -339,12 +360,12 @@ class Granny2:
     @property
     def num_attachments(self):         # 0x1E Uint16
         # type: () -> int
-        return 0
+        return len(self.attachment_bones) if getattr(self, "attachment_bones", None) else 0
 
     @property
     def offset_attachments(self):      # 0x60 Uint32
         # type: () -> int
-        return 0
+        return getattr(self, "offset_attachment_bones", 0) or 0
 
     def calculate_offsets64(self):
 
@@ -378,7 +399,14 @@ class Granny2:
         self.offset_material_name_offsets = count
         for _ in range(self.num_materials):
             count += 8
-        
+
+        while (count % 16) != 0:
+            count += 1
+        # Attachment bones. Each entry: name pointer (8) + parent bone name
+        # pointer (8) + 4x4 matrix (64 floats-as-bytes = 64) = 80 bytes.
+        self.offset_attachment_bones = count
+        count += 80 * self.num_attachments
+
         while (count % 16) != 0:
             count += 1
         # Vertex Buffer
@@ -390,7 +418,12 @@ class Granny2:
         # Indices Buffer
         for mesh in self.mesh_buffer.values():
             mesh.offset_indices_buffer = count
-            count += mesh.num_polygons * 6
+            # 2 bytes per index. Normally 3 indices per entry (triangles), but
+            # when a mesh is exported with quads preserved (Triangulate
+            # disabled), each entry has 4 -- using num_polygons * 6 here
+            # unconditionally under-allocates the buffer for that case and
+            # causes a hard crash partway through write() (confirmed).
+            count += sum(len(indices) for indices in mesh.indices_buffer.values()) * 2
         while (count % 16) != 0:
             count += 1
         # Bones Buffer
@@ -408,6 +441,10 @@ class Granny2:
             count += len(mesh.name) + 1
         for name in self.material_names.values():
             count += len(name) + 1
+        if getattr(self, "attachment_bones", None):
+            for attachment in self.attachment_bones:
+                count += len(attachment["name"]) + 1
+                count += len(attachment["bone"]) + 1
         for mesh in self.mesh_buffer.values():
             if mesh.bone_buffer:
                 for bone in mesh.bone_buffer.values():
@@ -463,6 +500,12 @@ class Granny2:
             count += 4
         while (count % 16) != 0:
             count += 1
+        # Attachment bones. Each entry: name pointer (4) + parent bone name
+        # pointer (4) + 4x4 matrix (64 floats-as-bytes = 64) = 72 bytes.
+        self.offset_attachment_bones = count
+        count += 72 * self.num_attachments
+        while (count % 16) != 0:
+            count += 1
         # Vertex Buffer
         for mesh in self.mesh_buffer.values():
             mesh.offset_vertex_buffer = count
@@ -472,7 +515,12 @@ class Granny2:
         # Indices Buffer
         for mesh in self.mesh_buffer.values():
             mesh.offset_indices_buffer = count
-            count += mesh.num_polygons * 6
+            # 2 bytes per index. Normally 3 indices per entry (triangles), but
+            # when a mesh is exported with quads preserved (Triangulate
+            # disabled), each entry has 4 -- using num_polygons * 6 here
+            # unconditionally under-allocates the buffer for that case and
+            # causes a hard crash partway through write() (confirmed).
+            count += sum(len(indices) for indices in mesh.indices_buffer.values()) * 2
         while (count % 16) != 0:
             count += 1
         # Bones Buffer
@@ -490,6 +538,10 @@ class Granny2:
             count += len(mesh.name) + 1
         for name in self.material_names.values():
             count += len(name) + 1
+        if getattr(self, "attachment_bones", None):
+            for attachment in self.attachment_bones:
+                count += len(attachment["name"]) + 1
+                count += len(attachment["bone"]) + 1
         for mesh in self.mesh_buffer.values():
             if mesh.bone_buffer:
                 for bone in mesh.bone_buffer.values():
@@ -503,6 +555,12 @@ class Granny2:
         count += 8 * self.num_materials
         for mesh in self.mesh_buffer.values():
             count += 8 * mesh.num_used_bones
+        # 2 pointer entries per attachment bone (name, parent bone name) --
+        # this was missing here, even though the 64-bit path (which instead
+        # uses the num_cached_offsets property directly) already accounts
+        # for it. Caused a buffer-overrun crash on any 32-bit export with
+        # attachment bones present.
+        count += 16 * self.num_attachments
         while (count % 16) != 0:
             count += 1
         # BNRY/LTLE
