@@ -3,7 +3,7 @@
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
     "author": "Crunch, Darth Atroxa, SWTOR Slicers",
-    "version": (5, 1, 0),
+    "version": (5, 1, 1),
     "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
@@ -34,6 +34,12 @@ from .ops.import_jba             import ImportJBA
 
 from .types.node         import NODE_OT_ngroup_edit
 from .ops.shaders_menu    import *  # classes and fn for Shader Editor's Add menu functionality
+from .ops.process_materials import (
+    SWTOR_OT_apply_materials_by_name,
+    SWTOR_OT_apply_materials_by_name_selected,
+    SWTOR_OT_apply_materials_by_name_file,
+    swtor_process_materials_submenu_element,
+)
 
 # ============================================================================
 # DEPRECATED SYSTEM -- ShaderNodeHeroEngine custom-node shaders
@@ -137,6 +143,9 @@ classes = (
     NODE_OT_ngroup_edit,
     NODE_MT_swtor_shaders_menu,
     NODE_OT_add_swtor_shader_group,
+    SWTOR_OT_apply_materials_by_name,
+    SWTOR_OT_apply_materials_by_name_selected,
+    SWTOR_OT_apply_materials_by_name_file,
 )
 
 # ============================================================================
@@ -204,6 +213,11 @@ def register():
     # "Add SWTOR Shader" entries. See ops/migrate_shaders.py.
     NODE_MT_swtor_shaders_menu_deprecated.append(swtor_migrate_submenu_element)  # DEPRECATED SYSTEM
 
+    # Materials-by-name (7b) entries -- appended onto the live
+    # NODE_MT_swtor_shaders_menu itself, split off with a separator from
+    # its seven "Add [X] Shader" entries. See ops/process_materials.py.
+    NODE_MT_swtor_shaders_menu.append(swtor_process_materials_submenu_element)
+
 
     # TAB-into-Nodegroup functionality
     wm = bpy.context.window_manager
@@ -216,6 +230,7 @@ def register():
 
 
 def unregister():
+    NODE_MT_swtor_shaders_menu.remove(swtor_process_materials_submenu_element)
     NODE_MT_swtor_shaders_menu_deprecated.remove(swtor_migrate_submenu_element)  # DEPRECATED SYSTEM
     bpy.types.NODE_MT_add.remove(swtor_shaders_submenu_element_deprecated)  # DEPRECATED SYSTEM
     bpy.types.NODE_MT_add.remove(swtor_shaders_submenu_element)

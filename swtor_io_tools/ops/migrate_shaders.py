@@ -173,11 +173,13 @@ def _load_default_map_image(node_name):
 # build_swtor_shader_material()).
 #
 # image_maps: (PointerProperty attr name on ShaderNodeHeroEngine, new
-#   group's external Image Texture node name). The node-name half is
-#   identical to the old node's own internal node names (see
-#   node_deprecated.py's update_*Map() functions, e.g.
-#   self.node_tree.nodes['_d'] for diffuseMap) -- not a coincidence, the
-#   new system's names were adopted to match.
+#   group's external Image Texture node name). The node-name half must
+#   match SWTOR_SHADER_GROUPS' own node_name values exactly (see
+#   shaders_menu.py), since it indexes straight into the image_nodes
+#   dict build_swtor_shader_material() hands back below -- unrelated to
+#   the OLD node's own internal node names (still '_d'/'_n'/'_s'/'_h'/
+#   '_m', see node_deprecated.py's update_*Map() functions), which this
+#   config never touches.
 # palettes: list of (index, include_metallic_specular).
 # flesh: whether Flesh Brightness / Flush Tone apply for this type.
 #
@@ -187,10 +189,10 @@ def _load_default_map_image(node_name):
 MIGRATE_CONFIGS = {
     CREATURE[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
-            ("paletteMaskMap", "_m"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
+            ("paletteMaskMap", "paletteMaskMap"),
             ("directionMap", "directionMap"),
         ],
         "palettes": [],
@@ -198,11 +200,11 @@ MIGRATE_CONFIGS = {
     },
     EYE[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
-            ("paletteMap", "_h"),
-            ("paletteMaskMap", "_m"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
+            ("paletteMap", "paletteMap"),
+            ("paletteMaskMap", "paletteMaskMap"),
         ],
         # Metallic Specular: the old node never actually wired this for
         # Eye (a pre-existing bug, since fixed in eye_group()) -- per
@@ -213,22 +215,22 @@ MIGRATE_CONFIGS = {
     },
     GARMENT[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
-            ("paletteMap", "_h"),
-            ("paletteMaskMap", "_m"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
+            ("paletteMap", "paletteMap"),
+            ("paletteMaskMap", "paletteMaskMap"),
         ],
         "palettes": [(1, True), (2, True)],
         "flesh": False,
     },
     HAIRC[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
-            ("paletteMap", "_h"),
-            ("paletteMaskMap", "_m"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
+            ("paletteMap", "paletteMap"),
+            ("paletteMaskMap", "paletteMaskMap"),
             ("directionMap", "directionMap"),
         ],
         "palettes": [(1, True)],
@@ -236,11 +238,11 @@ MIGRATE_CONFIGS = {
     },
     SKINB[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
-            ("paletteMap", "_h"),
-            ("paletteMaskMap", "_m"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
+            ("paletteMap", "paletteMap"),
+            ("paletteMaskMap", "paletteMaskMap"),
             ("ageMap", "ageMap"),
             ("complexionMap", "complexionMap"),
             ("facepaintMap", "facepaintMap"),
@@ -250,9 +252,9 @@ MIGRATE_CONFIGS = {
     },
     UBER[0]: {
         "image_maps": [
-            ("diffuseMap", "_d"),
-            ("rotationMap", "_n"),
-            ("glossMap", "_s"),
+            ("diffuseMap", "diffuseMap"),
+            ("rotationMap", "rotationMap1"),
+            ("glossMap", "glossMap"),
         ],
         "palettes": [],
         "flesh": False,

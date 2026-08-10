@@ -60,6 +60,12 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    gr2_apply_materials_by_name_default: bpy.props.BoolProperty(
+        name="Apply Materials By Name By Default",
+        description="Default state of the .gr2 importer's 'Apply Materials By Name' option: after\nimport, looks up each material's name against a real .mat file in the Resources\nDirectory (or Legacy Resources Directory) and builds its native SWTOR shader\nautomatically. Materials with no matching .mat file are left alone, no error.\n\nOnly affects direct .gr2 imports -- the NPC/Character (.json) importer always\nsources its own material data from the json file instead.\n\nCan still be switched per-import in the importer's own panel",
+        default=False,
+    )
+
 
     # NPC/Character (.json) import ones:
 
@@ -141,6 +147,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'gr2_name_as_filename', text="Name Imported Objects As Filenames")
         boxcol.prop(self,'gr2_apply_axis_conversion', text="'Apply' Axis Conversion")
         boxcol.prop(self,'gr2_blender_friendly_skeleton', text="Blender Friendly Skeleton")
+        boxcol.prop(self,'gr2_apply_materials_by_name_default', text="Apply Materials By Name")
         boxcol.prop(self,'gr2_scale_object', text="Scale Imported Objects/Characters")
         slider_split = boxcol.split(factor=0.1)
         slider_split.enabled = self.gr2_scale_object
