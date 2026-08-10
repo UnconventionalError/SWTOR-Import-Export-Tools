@@ -149,6 +149,12 @@ class ImportGR2(Operator):
         default=False,
     )
 
+    apply_materials_by_name: BoolProperty(
+        name="Apply Materials By Name",
+        description="After import, looks up each material's name against a real .mat file in the\nResources Directory (or Legacy Resources Directory) and builds its native SWTOR\nshader automatically.\n\nMaterials with no matching .mat file are left alone, no error -- plenty of\nlegitimate .gr2 materials won't have one.\n\nRequires a Resources Directory to be set in this add-on's Preferences",
+        default=False,  # seeded from add-on Preferences in invoke()
+    )
+
     enforce_neutral_settings: BoolProperty(
         name="Enforce Neutral Settings",
         description="Temporarily overrides this Add-on's settings\nwith those of older versions for compatibility with older tools",
@@ -186,6 +192,7 @@ class ImportGR2(Operator):
         self.scale_object           = prefs.gr2_scale_object
         self.scale_factor           = prefs.gr2_scale_factor
         self.blender_friendly_skeleton = prefs.gr2_blender_friendly_skeleton
+        self.apply_materials_by_name = prefs.gr2_apply_materials_by_name_default
         self.job_results_rich       = False
         self.job_results_accumulate = False
 
@@ -1014,6 +1021,30 @@ def load(operator, context, filepath = ""):
                                       apply_axis_conversion = prefs.gr2_apply_axis_conversion,
                                       blender_friendly_skeleton = prefs.gr2_blender_friendly_skeleton,
                                       )
+
+        # Automatic materials-by-name (7a) -- looks up each newly-
+        # imported object's *original* SWTOR material names (see
+        # build()'s "gr2_material_names" round-trip property) against
+        # real .mat files and builds their native SWTOR shaders.
+        #
+        # Only for genuine standalone .gr2 imports (this operator's own
+        # bl_idname) -- deliberately excludes the NPC/Character (.json)
+        # importer's internal calls into this same load() (bl_idname
+        # "import_mesh.gr2_json"), which source material data from the
+        # json file exclusively; running this there would clash with
+        # that (confirmed with Crunch). Also excluded under "Enforce
+        # Neutral Settings", which exists specifically for vanilla,
+        # older-tool-compatible behavior.
+        if not operator.enforce_neutral_settings and operator.bl_idname == 'IMPORT_MESH_OT_gr2':
+            if operator.options.is_invoke:
+                apply_materials_by_name = operator.apply_materials_by_name
+            else:
+                prefs = bpy.context.preferences.addons["swtor_io_tools"].preferences
+                apply_materials_by_name = prefs.gr2_apply_materials_by_name_default
+
+            if apply_materials_by_name and objects_names:
+                from .process_materials import apply_materials_by_name_after_import
+                apply_materials_by_name_after_import(objects_names)
 
         
         # job_results-filling section

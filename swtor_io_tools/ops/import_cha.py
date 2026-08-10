@@ -22,6 +22,7 @@ from mathutils import Vector, Matrix
 
 from .import_gr2 import load as ImportGR2_load
 from .shaders_menu import build_swtor_shader_material
+from ..types.mat import read_mat_summary
 from ..types.shared import job_results
 
 
@@ -298,10 +299,10 @@ DERIVED_CONFIGS = {
     "Creature": {
         "shader_derived": "CREATURE",
         "maps": [
-            ("diffuseMap", "_d", True),
-            ("rotationMap", "_n", True),
-            ("glossMap", "_s", True),
-            ("paletteMaskMap", "_m", True),
+            ("diffuseMap", "diffuseMap", True),
+            ("rotationMap", "rotationMap1", True),
+            ("glossMap", "glossMap", True),
+            ("paletteMaskMap", "paletteMaskMap", True),
             ("directionMap", "directionMap", False),
         ],
         "palettes": [],
@@ -310,11 +311,11 @@ DERIVED_CONFIGS = {
     "Eye": {
         "shader_derived": "EYE",
         "maps": [
-            ("diffuseMap", "_d", True),
-            ("rotationMap", "_n", True),
-            ("glossMap", "_s", True),
-            ("paletteMap", "_h", True),
-            ("paletteMaskMap", "_m", True),
+            ("diffuseMap", "diffuseMap", True),
+            ("rotationMap", "rotationMap1", True),
+            ("glossMap", "glossMap", True),
+            ("paletteMap", "paletteMap", True),
+            ("paletteMaskMap", "paletteMaskMap", True),
         ],
         # Metallic Specular was never wired up in the old custom node (a
         # pre-existing bug, confirmed by Crunch, not intentional) -- now
@@ -326,11 +327,11 @@ DERIVED_CONFIGS = {
     "Garment": {
         "shader_derived": "GARMENT",
         "maps": [
-            ("diffuseMap", "_d", True),
-            ("rotationMap", "_n", True),
-            ("glossMap", "_s", True),
-            ("paletteMap", "_h", True),
-            ("paletteMaskMap", "_m", True),
+            ("diffuseMap", "diffuseMap", True),
+            ("rotationMap", "rotationMap1", True),
+            ("glossMap", "glossMap", True),
+            ("paletteMap", "paletteMap", True),
+            ("paletteMaskMap", "paletteMaskMap", True),
         ],
         "palettes": [(1, True), (2, True)],
         "flesh": False,
@@ -338,11 +339,11 @@ DERIVED_CONFIGS = {
     "HairC": {
         "shader_derived": "HAIRC",
         "maps": [
-            ("diffuseMap", "_d", True),
-            ("rotationMap", "_n", True),
-            ("glossMap", "_s", True),
-            ("paletteMap", "_h", True),
-            ("paletteMaskMap", "_m", True),
+            ("diffuseMap", "diffuseMap", True),
+            ("rotationMap", "rotationMap1", True),
+            ("glossMap", "glossMap", True),
+            ("paletteMap", "paletteMap", True),
+            ("paletteMaskMap", "paletteMaskMap", True),
             ("directionMap", "directionMap", True),
         ],
         "palettes": [(1, True)],
@@ -351,14 +352,14 @@ DERIVED_CONFIGS = {
     "SkinB": {
         "shader_derived": "SKINB",
         "maps": [
-            ("diffuseMap", "_d", True),
+            ("diffuseMap", "diffuseMap", True),
             ("complexionMap", "complexionMap", False),
-            ("rotationMap", "_n", True),
+            ("rotationMap", "rotationMap1", True),
             ("facepaintMap", "facepaintMap", False),
-            ("glossMap", "_s", True),
+            ("glossMap", "glossMap", True),
             ("ageMap", "ageMap", False),
-            ("paletteMap", "_h", True),
-            ("paletteMaskMap", "_m", True),
+            ("paletteMap", "paletteMap", True),
+            ("paletteMaskMap", "paletteMaskMap", True),
         ],
         "palettes": [(1, True)],
         "flesh": True,
@@ -366,9 +367,9 @@ DERIVED_CONFIGS = {
     "Uber": {
         "shader_derived": "UBER",
         "maps": [
-            ("diffuseMap", "_d", True),
-            ("rotationMap", "_n", True),
-            ("glossMap", "_s", True),
+            ("diffuseMap", "diffuseMap", True),
+            ("rotationMap", "rotationMap1", True),
+            ("glossMap", "glossMap", True),
         ],
         "palettes": [],
         "flesh": False,
@@ -458,18 +459,40 @@ def get_or_create_material(resources_root, mat_name, derived, mat_info, object_n
 
     group_node, image_nodes = build_swtor_shader_material(new_mat, config["shader_derived"])
 
-    # Alpha / transparency: unified across every derived type, matching
-    # the original's CLIP-always behavior for json-driven import --
-    # deliberately NOT the per-type OPAQUE-for-Eye/SkinB default that the
-    # interactive "Add SWTOR Shader" menu uses (confirmed with Crunch as
-    # an intentional, pre-existing difference between the two entry
-    # points, not something to unify).
-    new_mat.alpha_threshold = 0.5
+    # Alpha / transparency: sourced from the real .mat file's own
+    # <AlphaMode>/<AlphaTestValue> (Tier 1, types/mat.py) when it can be
+    # resolved, replacing this function's previous hardcoded CLIP-always
+    # behavior. Jedipedia json data doesn't carry alpha settings at all,
+    # so this is the only source of truth for it -- confirmed with
+    # Crunch. Falls back to the old hardcoded values (CLIP, 0.5) if the
+    # .mat file can't be found/parsed under resources_root, so a missing
+    # file never blocks an import.
+    #
+    # Deliberately does NOT run Tier 1's skip-list check here -- json
+    # data is always treated as already-correct (confirmed with Crunch),
+    # unlike ops/process_materials.py's materials-by-name entry points,
+    # which do apply it.
     new_mat.show_transparent_back = False
     new_mat.surface_render_method = "DITHERED"
-    group_node.inputs['Alpha Blend'].default_value = False
-    group_node.inputs['Alpha Test'].default_value = True
-    group_node.inputs['Alpha Test Value'].default_value = 0.5
+
+    mat_summary = None
+    mat_path = resolve_resource_path(resources_root, mat_info.get("matPath"))
+    if mat_path is not None:
+        mat_summary = read_mat_summary(mat_path, mat_name)
+
+    if mat_summary is not None:
+        alpha_blend = mat_summary.alpha_blend
+        alpha_test = mat_summary.alpha_test
+        alpha_test_value = mat_summary.alpha_test_value
+    else:
+        alpha_blend = False
+        alpha_test = True
+        alpha_test_value = 0.5
+
+    new_mat.alpha_threshold = alpha_test_value
+    group_node.inputs['Alpha Blend'].default_value = alpha_blend
+    group_node.inputs['Alpha Test'].default_value = alpha_test
+    group_node.inputs['Alpha Test Value'].default_value = alpha_test_value
 
     for json_key, node_name, required in config["maps"]:
         if required or json_key in dds_paths:
@@ -494,7 +517,7 @@ def get_or_create_material(resources_root, mat_name, derived, mat_info, object_n
     # A one-shot bake at import time rather than a live callback -- see
     # this function's docstring re: object_name.
     if derived == "SkinB" and object_name and "head" in object_name.lower():
-        rotation_image = image_nodes['_n'].image
+        rotation_image = image_nodes['rotationMap1'].image
         if rotation_image is not None:
             group_node.inputs['Invert Alpha'].default_value = _is_first_pixel_white(rotation_image)
 

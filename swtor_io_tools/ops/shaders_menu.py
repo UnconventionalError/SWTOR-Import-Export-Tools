@@ -83,7 +83,7 @@ def _direction_vector_source(directionUV_y):
     relative offsets Koda used for HairC (-80 for Color, -100 for Alpha).
     """
     return {
-        'rotation_node': '_n',
+        'rotation_node': 'rotationMap1',
         'directionUV_position': (-1140.0, directionUV_y),
         'color_reroutes': _DIRECTION_COLOR_NEAR + [(-1160.0, -300.0), (-1160.0, directionUV_y - 80.0)],
         'alpha_reroutes': _DIRECTION_ALPHA_NEAR + [(-1180.0, -280.0), (-1180.0, directionUV_y - 100.0)],
@@ -94,30 +94,30 @@ SWTOR_SHADER_GROUPS = {
     "UBER": {
         'builder': uber_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
         ],
         'alpha_defaults': (False, True),  # Alpha Blend, Alpha Test (CLIP)
     },
     "EYE": {
         'builder': eye_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
-            {'node_name': '_h', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'paletteMap', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
         ],
         'alpha_defaults': (False, False),  # Alpha Blend, Alpha Test (OPAQUE)
     },
     "CREATURE": {
         'builder': creature_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -620.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -620.0)},
             {'node_name': 'directionMap', 'label': 'DirectionMap', 'color_socket': 'DirectionMap Color', 'alpha_socket': 'DirectionMap Alpha', 'position': (-680.0, -920.0), 'vector_source': _direction_vector_source(-920.0)},
         ],
         'alpha_defaults': (False, True),  # Alpha Blend, Alpha Test (CLIP)
@@ -125,11 +125,11 @@ SWTOR_SHADER_GROUPS = {
     "HAIRC": {
         'builder': hairc_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
-            {'node_name': '_h', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'paletteMap', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
             {'node_name': 'directionMap', 'label': 'DirectionMap', 'color_socket': 'DirectionMap Color', 'alpha_socket': 'DirectionMap Alpha', 'position': (-680.0, -1220.0), 'vector_source': _direction_vector_source(-1220.0)},
         ],
         'alpha_defaults': (False, True),  # Alpha Blend, Alpha Test (CLIP)
@@ -137,11 +137,11 @@ SWTOR_SHADER_GROUPS = {
     "HAIRC_MODERN": {
         'builder': hairc_modern_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
-            {'node_name': '_h', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'paletteMap', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
             {'node_name': 'directionMap', 'label': 'DirectionMap', 'color_socket': 'DirectionMap Color', 'alpha_socket': 'DirectionMap Alpha', 'position': (-680.0, -1220.0), 'vector_source': _direction_vector_source(-1220.0)},
         ],
         'alpha_defaults': (False, True),  # Alpha Blend, Alpha Test (CLIP) -- matches HairC
@@ -149,18 +149,18 @@ SWTOR_SHADER_GROUPS = {
     "GARMENT": {
         'builder': garment_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
-            {'node_name': '_h', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, 0.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -320.0)},
+            {'node_name': 'paletteMap', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -620.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -920.0)},
         ],
         'alpha_defaults': (False, True),  # Alpha Blend, Alpha Test (CLIP)
     },
     "SKINB": {
         'builder': skinb_group,
         'maps': [
-            {'node_name': '_d', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
+            {'node_name': 'diffuseMap', 'label': '_d DiffuseMap', 'color_socket': 'DiffuseMap Color', 'alpha_socket': 'DiffuseMap Alpha', 'position': (-680.0, 300.0)},
             # Secondary column (x=-1080), matching Koda's own tiering of
             # these three as less-central than the other five. Reroute
             # coordinates adopted verbatim from Koda's SkinB (their
@@ -168,14 +168,14 @@ SWTOR_SHADER_GROUPS = {
             # rows too, so no Y-shift was needed).
             {'node_name': 'complexionMap', 'label': 'ComplexionMap', 'color_socket': 'ComplexionMap Color', 'alpha_socket': 'ComplexionMap Alpha', 'position': (-1080.0, 300.0),
              'color_reroutes': [(-680.0, 20.0), (-340.0, 20.0)], 'alpha_reroutes': [(-680.0, 0.0), (-340.0, 0.0)]},
-            {'node_name': '_n', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, -60.0)},
+            {'node_name': 'rotationMap1', 'label': '_n RotationMap1', 'color_socket': 'RotationMap1 Color', 'alpha_socket': 'RotationMap1 Alpha', 'position': (-680.0, -60.0)},
             {'node_name': 'facepaintMap', 'label': 'FacepaintMap', 'color_socket': 'FacepaintMap Color', 'alpha_socket': 'FacepaintMap Alpha', 'position': (-1080.0, -60.0),
              'color_reroutes': [(-680.0, -340.0), (-340.0, -340.0)], 'alpha_reroutes': [(-680.0, -360.0), (-340.0, -360.0)]},
-            {'node_name': '_s', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -420.0)},
+            {'node_name': 'glossMap', 'label': '_s GlossMap', 'color_socket': 'GlossMap Color', 'alpha_socket': 'GlossMap Alpha', 'position': (-680.0, -420.0)},
             {'node_name': 'ageMap', 'label': 'AgeMap', 'color_socket': 'AgeMap Color', 'alpha_socket': 'AgeMap Alpha', 'position': (-1080.0, -420.0),
              'color_reroutes': [(-680.0, -700.0), (-340.0, -700.0)], 'alpha_reroutes': [(-680.0, -720.0), (-340.0, -720.0)]},
-            {'node_name': '_h', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -740.0)},
-            {'node_name': '_m', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -1060.0)},
+            {'node_name': 'paletteMap', 'label': '_h PaletteMap', 'color_socket': 'PaletteMap Color', 'alpha_socket': 'PaletteMap Alpha', 'position': (-680.0, -740.0)},
+            {'node_name': 'paletteMaskMap', 'label': '_m PaletteMaskMap', 'color_socket': 'PaletteMaskMap Color', 'alpha_socket': 'PaletteMaskMap Alpha', 'position': (-680.0, -1060.0)},
         ],
         'alpha_defaults': (False, False),  # Alpha Blend, Alpha Test (OPAQUE)
     },
@@ -215,6 +215,7 @@ def build_swtor_shader_material(material, shader_type):
     group_node.location = (0.0, 300.0)
     group_node.width = 400.0
     group_node.label = group_node.node_tree.name
+    group_node.name = group_node.node_tree.name
 
     # Maps whose own direct group connection is instead handled by another
     # map's vector_source detour (see below) -- skip wiring these normally.
@@ -249,6 +250,8 @@ def build_swtor_shader_material(material, shader_type):
         image_node = mat_nodes.new(type='ShaderNodeTexImage')
         image_node.label = m['label']
         image_node.location = m['position']
+        # node_name IS the real camelCase Blender node name directly --
+        # no shorthand/translation involved (see SWTOR_SHADER_GROUPS).
         image_node.name = m['node_name']
         image_node.width = 340.0
         image_nodes[m['node_name']] = image_node
@@ -261,6 +264,8 @@ def build_swtor_shader_material(material, shader_type):
             directionUV.location = vector_source['directionUV_position']
             directionUV.node_tree = direction_map_uv()
             directionUV.width = 400.0
+            directionUV.label = directionUV.node_tree.name
+            directionUV.name = directionUV.node_tree.name
 
             # Branch reroute: fans out to the main group's Rotation input
             # AND continues the detour chain toward DirectionMapUV.
