@@ -24,6 +24,26 @@ from ..utils.binary import ArrayBuffer, DataView
 from ..utils.string import path_split, readCString
 
 
+# Bones authored with a genuine 180°-around-their-own-Y rest orientation
+# relative to their parent - the classic 3ds Max Biped root-bone convention
+# (Bip01 points "backward" relative to the node above it by design). This is
+# a real, correct fact about the bind pose, not a bug in it - but it means
+# a bone's own jba rotation channel (which encodes motion relative to that
+# flipped rest, same as every other bone) needs the same 180° accounted for
+# when composing pose_bone.matrix_basis below, or an unanimated frame comes
+# out as a spurious 180° flip instead of the identity it should be.
+#
+# This is intentionally a short, explicit name list rather than automatic
+# per-bone detection (e.g. flagging any bone whose rest is ~180° from its
+# parent). Bip01 is the only bone this has ever been observed on; a wrong
+# auto-detected match on some other bone with a genuinely-intended large
+# rest rotation would silently corrupt that bone's motion with no obvious
+# symptom, which is worse than this list occasionally needing a bone added
+# to it by hand.
+KNOWN_180_FLIP_BONES = {"Bip01"}
+BONE_REST_FLIP_CORRECTION = Matrix.Rotation(math.pi, 4, 'Y')
+
+
 class ImportJBA(Operator):
     """Import from SWTOR JBA file format (.jba)"""
     bl_idname = "import_animation.jba"  # DO NOT CHANGE
@@ -268,11 +288,16 @@ def read(operator, filepath):
                         dv, pos, bone.translation_base, bone.translation_stride)
                     pos += 4
             else:
+                # No translation track for this bone in this block: the
+                # stride quantizes a range that has no samples, so the
+                # correct value is translation_base on its own (raw = 0),
+                # not translation_base plus the stride's maximum quantized
+                # span (see build()'s comment on why translation_base is
+                # never used as an absolute value on its own either way -
+                # this bone will end up with delta == 0, same effect as
+                # any other bone whose track happens not to move).
                 for k in range(block.num_frames):
-                    pos_x = bone.translation_base.x + 2047 * bone.translation_stride.x
-                    pos_y = bone.translation_base.y + 2047 * bone.translation_stride.y
-                    pos_z = bone.translation_base.z + 1023 * bone.translation_stride.z
-                    bone.translations[block.start_frame + k] = Vector((pos_x, pos_y, pos_z))
+                    bone.translations[block.start_frame + k] = bone.translation_base.copy()
 
         pos = block_end
 
@@ -396,24 +421,65 @@ def build(operator, context, filepath, jba):
                 if pose_bone.parent:
                     mat_rest = pose_bone.parent.bone.matrix_local.inverted() @ mat_rest
 
+                if bone_name in KNOWN_180_FLIP_BONES:
+                    mat_rest = mat_rest @ BONE_REST_FLIP_CORRECTION
+
                 mat_rot = anim_bone.rotations[anim_frame].to_matrix().to_4x4()
 
+                # anim_bone.translations[frame] is an ABSOLUTE bone-to-parent
+                # offset as authored on whatever rig this specific clip was
+                # captured against - not necessarily this armature's own
+                # offset for the same bone (confirmed on a real
+                # shared-across-body-types clip: several static bones were
+                # off by 15-35% against the target skeleton's actual
+                # proportions, visibly pulling joints out of place). Using
+                # it directly is only safe when it happens to match.
+                #
+                # What's reliable is the DELTA from the file's own
+                # translation_base, since that's this bone's actual motion
+                # within the clip regardless of which rig authored it. So
+                # every bone's translation is built the same way: take this
+                # armature's own rest-pose offset and add only that delta on
+                # top, converted through morpheme_space like everything
+                # else. A bone with no real motion (delta == 0, whether
+                # because it never had a per-frame track at all or because
+                # it has one that happens to be constant) lands exactly on
+                # this armature's own rest translation; a bone that really
+                # animates (e.g. Root) keeps that motion, applied relative
+                # to this armature's own bind pose instead of the file's.
+                #
+                # This also covers what ignore_facial_bones needs (ignore
+                # this bone's translation animation entirely) as the delta
+                # being forced to zero, rather than needing a separate
+                # translation composition for that case.
                 if operator.ignore_facial_bones and bone_name.lower().startswith("fc_"):
-                    mat_trans = Matrix.Translation(mat_rest.to_translation())
-                    mat_bone = mat_trans @ morpheme_space_inv @ mat_rot @ morpheme_space
+                    delta = Vector((0.0, 0.0, 0.0))
                 else:
-                    mat_trans = Matrix.Translation(anim_bone.translations[anim_frame])
-                    mat_bone = morpheme_space_inv @ mat_trans @ mat_rot @ morpheme_space
+                    delta = anim_bone.translations[anim_frame] - anim_bone.translation_base
+
+                mat_bone = morpheme_space_inv @ Matrix.Translation(delta) @ mat_rot @ morpheme_space
+                mat_bone.translation = mat_rest.to_translation() + mat_bone.translation
 
                 frame = jba.fps * jba.length * anim_frame / jba.num_frames + 1
                 pose_bone.matrix_basis = mat_rest.inverted() @ mat_bone
                 pose_bone.keyframe_insert(data_path="location", frame=frame)
-                if not (operator.delete_180 and bone_name == "Bip01"):
+                if not (operator.delete_180 and bone_name in KNOWN_180_FLIP_BONES):
                     pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
 
-    if operator.delete_180 and "Bip01" in ob.pose.bones:
-        # CHECK THAT THIS QUATERNION ROTATION IS VALID IN ALL CASES!!!
-        ob.pose.bones["Bip01"].rotation_quaternion = (1, 0, 0, 0)
+    # delete_180 is a distinct, deliberate feature from the rest-pose
+    # correction above (which is always applied and just makes an
+    # unanimated Bip01 come out as identity instead of a spurious 180°
+    # flip, the same as every other bone). This is for the separate case
+    # where a clip's Bip01 rotation is genuinely animated with a real ~180°
+    # character-facing turn (SWTOR does this so gameplay animations play
+    # with the character facing away from the camera), which some users
+    # want stripped out entirely - e.g. it can wreck cloth/physics sims
+    # otherwise. When enabled, this discards all of that bone's rotation
+    # data and forces it to identity for the whole clip.
+    if operator.delete_180:
+        for bone_name in KNOWN_180_FLIP_BONES:
+            if bone_name in ob.pose.bones:
+                ob.pose.bones[bone_name].rotation_quaternion = (1, 0, 0, 0)
 
     return True
 
