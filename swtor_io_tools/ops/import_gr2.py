@@ -834,7 +834,30 @@ def build(gr2,
             matrix = Matrix([bone.root_to_bone[j*4:j*4+4] for j in range(4)])
             # print(matrix, i , bone.name)  # for diagnostics
             matrix.transpose()
-            armature_bone.transform(matrix.inverted())
+            target = matrix.inverted()
+
+            # Bone direction (head/tail) only here -- roll is set explicitly
+            # below, not left to transform()'s own roll recalculation.
+            #
+            # WHY: EditBone.transform(matrix)'s automatic roll recompute does
+            # not reliably reproduce root_to_bone's actual bind-pose
+            # orientation for a bone whose direction isn't world +Y (i.e.
+            # every bone except the first couple in a Y-up-authored chain,
+            # since a freshly-created edit bone starts pointing +Y). It's
+            # fine for direction; it just doesn't round-trip the target's
+            # roll (local X/Z) correctly in the general case. Verified
+            # empirically against a real 49-bone rig: transform()'s own roll
+            # was off (by varying, bone-dependent amounts) for every bone
+            # whose bind direction wasn't +Y, while align_roll() below
+            # reproduces root_to_bone's rotation to float32 precision on
+            # every bone, including those.
+            #
+            # align_roll(vector) points the bone's local +Z axis at the
+            # given world-space vector, so we hand it root_to_bone's own Z
+            # axis (target's third column) as that target.
+            armature_bone.transform(target, roll=False)
+            target_z_axis = Vector((target[0][2], target[1][2], target[2][2]))
+            armature_bone.align_roll(target_z_axis)
 
         # "Blender Friendly Skeleton": roll cleanup.
         # SKELETON FILES ONLY. Does not move or resize any bone (head, tail,
