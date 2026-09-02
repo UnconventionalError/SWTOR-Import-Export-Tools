@@ -40,7 +40,7 @@ from typing import List, NamedTuple
 import bpy
 
 from ..types.node_deprecated import CREATURE, EYE, GARMENT, HAIRC, SKINB, UBER
-from .shaders_menu import build_swtor_shader_material
+from ..types.shader_templates import find_main_shader_group_node, get_or_build_shader_material
 
 
 # ---------------------------------------------------------------------------
@@ -301,10 +301,19 @@ def migrate_material(material):
     # type: (bpy.types.Material) -> MigrationResult
     """
     Converts one material's ShaderNodeHeroEngine node (if present) to the
-    equivalent native Atroxa Shader node group, in place -- same material
-    identity, node graph swapped internally, old node (and its now-
-    orphaned private node_tree) deleted once the new graph is confirmed
-    built.
+    equivalent native Atroxa Shader, replacing the whole material via
+    the same append-from-template mechanism import_cha.py and the
+    interactive Add-menu use (types/shader_templates.py) -- every
+    existing user of the old material redirected onto the new one, old
+    material (old_node and its private node_tree included) deleted, new
+    one renamed to take over the original name.
+
+    Real per-material values that only exist on the old node -- assigned
+    images, alpha mode, palette settings, flesh/flush -- are read off
+    BEFORE replacement and written onto the new material's equivalent
+    inputs afterward, so migrating never loses an already-imported
+    material's actual appearance. Only the NODE GRAPH gets blanket-
+    replaced; the data it was carrying does not.
 
     Always completes the conversion even if a default map asset can't be
     found -- that map is simply left unassigned (same as it would've been
@@ -319,66 +328,110 @@ def migrate_material(material):
     if config is None:
         raise ValueError(f"Unrecognized ShaderNodeHeroEngine.derived value: {old_node.derived!r}")
 
-    # ShaderNodeHeroEngine exposes no material-graph input sockets at all
-    # (only a "Shader" output, see node_tree_deprecated.py's
-    # add_output_socket_if_needed() calls) -- so nothing upstream feeds
-    # it, and build_swtor_shader_material() can be called immediately.
-    # It doesn't clear existing nodes first (see its own docstring), so
-    # this adds the new group + image nodes alongside the still-present
-    # old node without any name collision (the old node's own image
-    # nodes live inside ITS private node_tree, not this material's).
-    group_node, image_nodes = build_swtor_shader_material(material, old_node.derived)
-
-    # Images -- already-loaded bpy.data.images datablocks, reassign
-    # directly onto the new external Image Texture nodes, no reload.
-    # Absent maps get DEFAULT_MAP_ASSETS' real game-default texture
-    # instead; if that can't be loaded either, the map is left
-    # unassigned and flagged in missing_assets.
+    # Everything below reads off `material`/`old_node` -- must happen
+    # BEFORE get_or_build_shader_material() replaces the material,
+    # which deletes this exact datablock outright (see its own
+    # docstring). Nothing past that call may touch `material` or
+    # `old_node` again; both become stale references the moment it
+    # returns.
+    old_images = {}
     missing_assets = []
     for attr_name, node_name in config["image_maps"]:
         image = getattr(old_node, attr_name)
         if image is None:
             image = _load_default_map_image(node_name)
         if image is not None:
-            image_nodes[node_name].image = image
+            old_images[node_name] = image
         elif node_name in DEFAULT_MAP_ASSETS:
             missing_assets.append(node_name[0].upper() + node_name[1:])
 
-    # Alpha: the old node's actual alpha_mode/alpha_test_value/
-    # alpha_invert are the real, correct values for this specific
-    # material -- read and preserve them faithfully, don't default them
-    # (unlike import_cha.py's json-driven import, which always forces
-    # CLIP -- not applicable here).
-    group_node.inputs['Alpha Blend'].default_value = (old_node.alpha_mode == 'BLEND')
-    group_node.inputs['Alpha Test'].default_value = (old_node.alpha_mode == 'CLIP')
-    group_node.inputs['Alpha Test Value'].default_value = old_node.alpha_test_value
-    group_node.inputs['Invert Alpha'].default_value = old_node.alpha_invert
+    # get_or_build_shader_material() below may internally orphan-purge
+    # (whenever it has to dedupe a colliding node group -- see
+    # types/shader_templates.py's _append_template_material()), and that
+    # purge is GLOBAL: it sweeps every currently zero-real-user
+    # datablock in the file, not just the duplicate it's actually after.
+    # Holding a Python reference to an Image here doesn't protect it --
+    # if its only real Blender-tracked user was old_node's own internal
+    # per-instance node tree (about to be deleted), it can already be at
+    # zero real users the moment we read it above, making it exactly as
+    # vulnerable as an unassigned material was earlier in this project.
+    # Fake-user each one for the duration; cleared again once each is
+    # reassigned onto the new material's image nodes below, where it
+    # picks up a real user again.
+    for image in old_images.values():
+        image.use_fake_user = True
 
-    # Palettes
+    # alpha_mode/alpha_test_value/alpha_invert are the real, correct
+    # values for this specific material -- read and preserve them
+    # faithfully, don't default them (unlike import_cha.py's json-driven
+    # import, which always forces CLIP -- not applicable here).
+    alpha_blend = (old_node.alpha_mode == 'BLEND')
+    alpha_test = (old_node.alpha_mode == 'CLIP')
+    alpha_test_value = old_node.alpha_test_value
+    alpha_invert = old_node.alpha_invert
+
+    palette_values = {}
     for index, include_metallic_specular in config["palettes"]:
         prefix = f"palette{index}"
-        socket_prefix = f"Palette{index} "
-        group_node.inputs[f'{socket_prefix}Hue'].default_value = getattr(old_node, f"{prefix}_hue")
-        group_node.inputs[f'{socket_prefix}Saturation'].default_value = getattr(old_node, f"{prefix}_saturation")
-        group_node.inputs[f'{socket_prefix}Brightness'].default_value = getattr(old_node, f"{prefix}_brightness")
-        group_node.inputs[f'{socket_prefix}Contrast'].default_value = getattr(old_node, f"{prefix}_contrast")
-        group_node.inputs[f'{socket_prefix}Specular'].default_value = getattr(old_node, f"{prefix}_specular")
+        palette_values[index] = {
+            "hue": getattr(old_node, f"{prefix}_hue"),
+            "saturation": getattr(old_node, f"{prefix}_saturation"),
+            "brightness": getattr(old_node, f"{prefix}_brightness"),
+            "contrast": getattr(old_node, f"{prefix}_contrast"),
+            # FloatVectorProperty (RGB) -- getattr() returns a
+            # bpy_prop_array, a live view into old_node's own RNA memory,
+            # NOT an independent copy the way a plain FloatProperty read
+            # is. tuple() forces an eager copy now, before old_node (and
+            # the material it belongs to) gets deleted a few lines down
+            # -- otherwise this reference goes stale in between and
+            # silently reads back garbage/zeroed data at the point of
+            # use, rather than raising.
+            "specular": tuple(getattr(old_node, f"{prefix}_specular")),
+        }
         if include_metallic_specular:
-            group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = getattr(old_node, f"{prefix}_metallic_specular")
+            palette_values[index]["metallic_specular"] = tuple(getattr(old_node, f"{prefix}_metallic_specular"))
+
+    flesh_brightness = old_node.flesh_brightness if config["flesh"] else None
+    flush_tone = tuple(old_node.flush_tone) if config["flesh"] else None
+
+    # Replace the whole material. force=True: this is a deliberate
+    # "convert this material now" action, not an idempotent build-once
+    # import call -- must replace even if (unexpectedly) something
+    # already-native already existed under this name.
+    original_name = material.name
+    new_mat = get_or_build_shader_material(old_node.derived, original_name, force=True)
+    group_node = find_main_shader_group_node(new_mat, old_node.derived)
+    image_nodes = {
+        node.name: node for node in new_mat.node_tree.nodes
+        if node.type == 'TEX_IMAGE'
+    }
+
+    # Images -- already-loaded bpy.data.images datablocks, reassign
+    # directly onto the new external Image Texture nodes, no reload.
+    for node_name, image in old_images.items():
+        image_nodes[node_name].image = image
+        image.use_fake_user = False
+
+    group_node.inputs['Alpha Blend'].default_value = alpha_blend
+    group_node.inputs['Alpha Test'].default_value = alpha_test
+    group_node.inputs['Alpha Test Value'].default_value = alpha_test_value
+    group_node.inputs['Invert Alpha'].default_value = alpha_invert
+
+    # Palettes
+    for index, values in palette_values.items():
+        socket_prefix = f"Palette{index} "
+        group_node.inputs[f'{socket_prefix}Hue'].default_value = values["hue"]
+        group_node.inputs[f'{socket_prefix}Saturation'].default_value = values["saturation"]
+        group_node.inputs[f'{socket_prefix}Brightness'].default_value = values["brightness"]
+        group_node.inputs[f'{socket_prefix}Contrast'].default_value = values["contrast"]
+        group_node.inputs[f'{socket_prefix}Specular'].default_value = values["specular"]
+        if "metallic_specular" in values:
+            group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = values["metallic_specular"]
 
     # Flesh / Flush
     if config["flesh"]:
-        group_node.inputs['Flesh Brightness'].default_value = old_node.flesh_brightness
-        group_node.inputs['Flush Tone'].default_value = old_node.flush_tone
-
-    # Delete the old node and its now-orphaned private per-instance
-    # node_tree (created in ShaderNodeHeroEngine.init() via
-    # bpy.data.node_groups.new()) -- otherwise it'd sit as dead data in
-    # the file until Blender's own orphan-data purge caught it.
-    old_tree = old_node.node_tree
-    material.node_tree.nodes.remove(old_node)
-    if old_tree is not None and old_tree.users == 0:
-        bpy.data.node_groups.remove(old_tree)
+        group_node.inputs['Flesh Brightness'].default_value = flesh_brightness
+        group_node.inputs['Flush Tone'].default_value = flush_tone
 
     return MigrationResult(converted=True, missing_assets=missing_assets)
 
@@ -409,10 +462,15 @@ def _migrate_and_report(operator, materials):
     failed = []  # (material_name, error)
 
     for material in materials:
+        # Captured before the call: migrate_material() deletes the old
+        # material datablock outright on a successful conversion (see
+        # its own docstring), so `material.name` would be a stale
+        # reference afterward.
+        original_name = material.name
         try:
             result = migrate_material(material)
         except Exception as err:
-            failed.append((material.name, str(err)))
+            failed.append((original_name, str(err)))
             continue
 
         if not result.converted:
@@ -420,7 +478,7 @@ def _migrate_and_report(operator, materials):
         else:
             converted += 1
             if result.missing_assets:
-                incomplete.append((material.name, result.missing_assets))
+                incomplete.append((original_name, result.missing_assets))
 
     for name, missing in incomplete:
         print(f"[SWTOR migrate] '{name}' migrated, but couldn't find default assets for: {', '.join(missing)}")
@@ -453,16 +511,20 @@ class SWTOR_OT_migrate_shader(bpy.types.Operator):
 
     def execute(self, context):
         material = context.material
+        # Captured before the call -- see _migrate_and_report()'s same
+        # note; migrate_material() deletes the old material datablock
+        # outright on a successful conversion.
+        original_name = material.name
         result = migrate_material(material)
         if not result.converted:
-            self.report({'WARNING'}, f"'{material.name}' has no deprecated SWTOR shader node to migrate")
+            self.report({'WARNING'}, f"'{original_name}' has no deprecated SWTOR shader node to migrate")
         elif result.missing_assets:
             self.report(
                 {'WARNING'},
-                f"Migrated '{material.name}', but couldn't find default assets for: {', '.join(result.missing_assets)}",
+                f"Migrated '{original_name}', but couldn't find default assets for: {', '.join(result.missing_assets)}",
             )
         else:
-            self.report({'INFO'}, f"Migrated '{material.name}' to the native Atroxa Shader")
+            self.report({'INFO'}, f"Migrated '{original_name}' to the native Atroxa Shader")
         return {'FINISHED'}
 
 

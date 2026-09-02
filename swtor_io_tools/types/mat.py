@@ -13,12 +13,17 @@ touches map/palette data.
 
 Tier 2 (read_mat_full): full <input>-list adapter, producing a dict
 shaped identically to a Jedipedia json entry's materialInfo (matPath +
-ddsPaths + otherValues), so it can be hand straight to
-ops/import_cha.py's existing get_or_create_material() unchanged. Only
-used by ops/process_materials.py, where there's no json to lean on --
-NPC import's own map/palette data stays json-sourced permanently (see
-handoff notes: .mat files lack NPC-only fields like complexionMap/
-ageMap defaults, and Crunch manually edits NPC json on occasion).
+ddsPaths + otherValues), so it can be handed straight to
+ops/import_cha.py's existing get_or_create_material() unchanged. Used by
+ops/process_materials.py (where there's no json to lean on at all, so
+this drives ddsPaths AND otherValues both) and by ops/import_cha.py's
+own use_mat_dds_paths option (where it only ever overrides specific
+"identity" ddsPaths keys -- diffuseMap/rotationMap/glossMap/paletteMap/
+paletteMaskMap/directionMap and friends -- never otherValues: NPC
+import's own palette/complexion/age/facepaint data stays json-sourced
+permanently regardless of that option, since a .mat file's own values
+for those are generic placeholders, not real per-NPC customization --
+confirmed against real data, see handoff notes / chat history).
 
 Carries forward the XML tag/semantic knowledge (not the output code)
 from the prior zg_swtor_tools addon's mat_process_named_materials.py,
@@ -46,7 +51,9 @@ CREATURE_LIKE = {"Creature", "HighQualityCharacter"}
 # "GarmentScrolling" internally too -- collapsing here as well just
 # keeps every caller's "derived" value uniformly "Garment").
 GARMENT_LIKE = {"Garment", "GarmentScrolling"}
-# Collapse onto the single "AnimatedUV" known-but-not-yet-built bucket.
+# Collapse variant Derived spellings onto DERIVED_CONFIGS' single
+# "AnimatedUV" key (ops/import_cha.py) -- no longer a "known but not yet
+# built" bucket now that a real template exists.
 ANIMATEDUV_LIKE = {
     "AnimatedUV", "AnimatedUVAlphaBlend", "AnimatedVFX", "AnimatedVFXAlphaBlend",
 }
@@ -54,7 +61,7 @@ ANIMATEDUV_LIKE = {
 # Recognized but not yet built (handoff §3): materials of these collapsed
 # types should be skipped cleanly (not mishandled, not force-fit into
 # DERIVED_CONFIGS). Real support is additive later, not a rework.
-KNOWN_UNBUILT_DERIVED = {"EmissiveOnly"} | {"AnimatedUV"}
+KNOWN_UNBUILT_DERIVED = {"EmissiveOnly"}
 
 _DERIVED_ALIASES = {}
 for _name in UBER_LIKE:
@@ -73,9 +80,9 @@ def collapse_derived(derived):
     """
     Collapses a .mat file's raw <Derived> value onto the canonical
     shader-family name used by ops/import_cha.py's DERIVED_CONFIGS
-    ("Uber"/"Creature"/"Garment"/"SkinB"/"Eye"/"HairC"), or onto
-    "AnimatedUV"/"EmissiveOnly" for the known-but-not-yet-built bucket
-    (see KNOWN_UNBUILT_DERIVED). Anything else passes through unchanged
+    ("Uber"/"Creature"/"Garment"/"SkinB"/"Eye"/"HairC"/"AnimatedUV"), or
+    onto "EmissiveOnly" for the known-but-not-yet-built bucket (see
+    KNOWN_UNBUILT_DERIVED). Anything else passes through unchanged
     -- DERIVED_CONFIGS.get() rejecting it is the caller's signal that
     it's a genuinely unsupported type, not this function's job to guess.
     """
@@ -152,9 +159,11 @@ def resolve_mat_path(mat_name, primary_resources_dir, legacy_resources_dir=None)
 # else (including "None", the common case) is neither. The native
 # Atroxa Shaders system computes alpha compositing entirely inside the
 # node group via these two booleans plus Alpha Test Value/Invert Alpha
-# -- material.surface_render_method stays "DITHERED" regardless (see
-# ops/shaders_menu.py's build_swtor_shader_material()), so no other
-# Blender-level alpha property needs to vary per AlphaMode.
+# -- material.surface_render_method stays "DITHERED" regardless (set
+# directly in ops/import_cha.py's get_or_create_material(), and baked
+# into every template material in bundled_data/Atroxa_Shaders.blend --
+# see types/shader_templates.py), so no other Blender-level alpha
+# property needs to vary per AlphaMode.
 _ALPHA_TEST_MODES = {"Test"}
 _ALPHA_BLEND_MODES = {"Full", "MultipassFull", "Add"}
 
@@ -209,11 +218,13 @@ def read_mat_summary(mat_path, mat_name=None):
 # ---------------------------------------------------------------------------
 
 # Only semantics actually consumed by DERIVED_CONFIGS' "maps" tuples
-# (ops/import_cha.py) get captured into ddsPaths -- everything else a
-# .mat file's <input> list carries (EmissiveMap, OffsetMap,
-# animatedWrinkle*, Rim*, Reflection*, vegetationParams*, UsesFur,
-# UVScaling, etc.) is intentionally ignored: none of it is wired into
-# any Atroxa Shaders node group.
+# (ops/import_cha.py) get captured into ddsPaths -- every OTHER texture
+# semantic a .mat file's <input> list carries (EmissiveMap, OffsetMap,
+# animatedWrinkle*, Rim*, Reflection*, vegetationParams*, etc.) is
+# intentionally ignored: none of it is wired into any Atroxa Shaders
+# node group. Non-texture semantics are handled differently -- see the
+# generic fallback in the parsing loop below, which captures everything
+# NOT explicitly matched first under its own exact .mat name.
 _TEXTURE_SEMANTIC_TO_DDS_KEY = {
     "DiffuseMap": "diffuseMap",
     "RotationMap1": "rotationMap",
@@ -224,6 +235,13 @@ _TEXTURE_SEMANTIC_TO_DDS_KEY = {
     "ComplexionMap": "complexionMap",
     "FacepaintMap": "facepaintMap",
     "AgeMap": "ageMap",
+    "AnimatedTexture1": "animatedTexture1",
+    "AnimatedTexture2": "animatedTexture2",
+    # FresnelGradient: the template's AnimatedUV material carries an
+    # unconnected Image Texture node for this (ready for when the shader
+    # actually uses it), but nothing consumes it yet -- included here
+    # anyway so a .dds path is at least captured/available already.
+    "FresnelGradient": "fresnelGradient",
 }
 
 _PALETTE_VECTOR_SEMANTICS = ("palette1", "palette2")
@@ -303,9 +321,28 @@ def read_mat_full(mat_path, mat_name=None):
         if semantic in _PALETTE_VECTOR_SEMANTICS or semantic in _PALETTE_RGBA_SEMANTICS:
             other_values[semantic] = [v.strip() for v in value.split(",")]
         elif semantic == "FlushTone":
+            # Renamed, not identity-captured -- get_or_create_material()
+            # reads this specific key ("flush"), not the .mat's own
+            # "FlushTone" semantic name. Takes priority over the generic
+            # fallback below, which would otherwise capture it under the
+            # wrong key.
             other_values["flush"] = [v.strip() for v in value.split(",")]
         elif semantic == "FleshBrightness":
+            # Same renaming reasoning as FlushTone above.
             other_values["fleshBrightness"] = value.strip()
+        elif semantic:
+            # Generic capture for every other non-texture semantic, under
+            # its own exact .mat name (not renamed) -- e.g. AnimatedUV's
+            # animTexTint0/animTexUVScrollSpeed0/etc, which DERIVED_CONFIGS
+            # entries read directly by these exact names. Comma-split into
+            # a list for multi-component values (vector4/uvscale/etc,
+            # matching palette's own shape above and a real json
+            # materialInfo.otherValues' own convention), else stored as a
+            # single stripped string. Values that no DERIVED_CONFIGS entry
+            # ever reads just sit here unused, same as every one of
+            # _DEFAULT_OTHER_VALUES' own always-present keys already does
+            # for shader types that don't need them.
+            other_values[semantic] = [v.strip() for v in value.split(",")] if "," in value else value.strip()
 
     mat_path_relative = "/" + "/".join(MATERIALS_SUBPATH) + "/" + name + ".mat"
 

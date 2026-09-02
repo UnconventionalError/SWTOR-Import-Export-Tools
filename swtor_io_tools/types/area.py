@@ -280,9 +280,11 @@ def expand_dyn(dyn_fqn):
 
 class AreaElement:
     """One raw element from an area json, as-parsed (no resolution/composition yet)."""
-    __slots__ = ("id", "asset_name", "parent_id", "position", "rotation", "scale", "final_position")
+    __slots__ = ("id", "asset_name", "parent_id", "position", "rotation", "scale", "final_position",
+                 "fx_spec_name")
 
-    def __init__(self, id, asset_name, parent_id, position, rotation, scale, final_position):
+    def __init__(self, id, asset_name, parent_id, position, rotation, scale, final_position,
+                 fx_spec_name=None):
         self.id = id
         self.asset_name = asset_name        # e.g. "\art\static\...\x.gr2" or "\spn\...\x.spn_p"
         self.parent_id = parent_id          # "0" for root elements
@@ -294,6 +296,14 @@ class AreaElement:
         self.final_position = final_position  # (x, y, z) world-space, or None if the source
                                                # element omitted it (not observed in real data
                                                # so far, but not assumed impossible)
+        self.fx_spec_name = fx_spec_name    # e.g. "\art\fx\fxspec\mtx\mtx_item_republic_banner.fxspec",
+                                             # or None -- only present on elements carrying a sibling
+                                             # "fx": {"fxSpecName": ...} object in the room export (seen
+                                             # so far on direct ".fxp" elements; see fxspec/area
+                                             # integration handoff for the ".spn_p"-indirected case,
+                                             # not covered by this field at all -- that path resolves
+                                             # through the separately-sourced bundled dyn data instead,
+                                             # not this one)
 
 
 def parse_area_json(data):
@@ -329,10 +339,15 @@ def parse_area_json(data):
             except (TypeError, ValueError):
                 final_position = None
 
+        fx_spec_name = None
+        fx = raw.get("fx")
+        if isinstance(fx, dict):
+            fx_spec_name = fx.get("fxSpecName") or None
+
         elements.append(AreaElement(
             id=id_, asset_name=asset_name, parent_id=parent_id,
             position=position, rotation=rotation, scale=scale,
-            final_position=final_position,
+            final_position=final_position, fx_spec_name=fx_spec_name,
         ))
     return elements
 

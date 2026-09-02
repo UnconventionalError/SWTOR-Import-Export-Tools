@@ -54,7 +54,9 @@ class MaterialProcessResult:
     Per-material outcome, for the operators' self.report() summaries.
 
     status is one of:
-        "built"        -- a native SWTOR shader was (re)built.
+        "built"        -- a native SWTOR shader was (re)built. Check
+                          missing_assets below -- "built" doesn't
+                          guarantee every texture was actually found.
         "skipped"      -- deliberately not processed; see `detail`
                           ("already built" or "skip-listed name").
         "not_found"    -- no matching .mat file under either Resources
@@ -68,16 +70,25 @@ class MaterialProcessResult:
                           `detail` has the message. Never propagates --
                           batch callers keep going through the rest of
                           their list.
-    """
-    __slots__ = ("name", "status", "detail")
 
-    def __init__(self, name, status, detail=""):
+    missing_assets is a list of (mat_name, relative_path) pairs -- one
+    per texture that's genuinely referenced by this material but
+    couldn't be found under either Resources Directory (see
+    get_or_create_material()'s own missing_assets parameter). Always
+    empty except on a "built" result: soft-fail, not an error -- the
+    material still gets built, just with that Image Texture node left
+    unassigned, same as import_cha.py's NPC pipeline.
+    """
+    __slots__ = ("name", "status", "detail", "missing_assets")
+
+    def __init__(self, name, status, detail="", missing_assets=None):
         self.name = name
         self.status = status
         self.detail = detail
+        self.missing_assets = missing_assets if missing_assets is not None else []
 
 
-def _get_resources_dirs():
+def get_resources_dirs():
     # type: () -> Tuple[Optional[str], Optional[str]]
     prefs = bpy.context.preferences.addons["swtor_io_tools"].preferences
     return prefs.swtor_resources_dir or None, prefs.swtor_legacy_resources_dir or None
@@ -101,13 +112,14 @@ def _build_named_material(mat_name, object_name=None):
     Returns (material, result). material is None unless result.status
     is "built" or "skipped" with detail "already built".
     """
-    from .import_cha import _has_swtor_shader_group, get_or_create_material
+    from .import_cha import UnrecognizedDerivedTypeError, get_or_create_material
+    from ..types.shader_templates import has_swtor_shader_group
 
     existing = bpy.data.materials.get(mat_name)
-    if existing is not None and _has_swtor_shader_group(existing):
+    if existing is not None and has_swtor_shader_group(existing):
         return existing, MaterialProcessResult(mat_name, "skipped", "already built")
 
-    primary_dir, legacy_dir = _get_resources_dirs()
+    primary_dir, legacy_dir = get_resources_dirs()
     if not primary_dir and not legacy_dir:
         return None, MaterialProcessResult(mat_name, "error", "no Resources Directory configured")
 
@@ -130,18 +142,40 @@ def _build_named_material(mat_name, object_name=None):
         return None, MaterialProcessResult(mat_name, "error", "couldn't parse .mat file")
 
     try:
+        # NOTE: passing primary_dir/legacy_dir here, NOT root_used/None.
+        # root_used only tells us where the .mat FILE resolved -- but a
+        # material's .dds textures can live under a different root
+        # entirely (confirmed real case, see ops/import_cha.py's
+        # get_or_create_material() docstring), so its own per-asset
+        # fallback needs both real roots to have any effect. The .mat
+        # file itself gets re-resolved once more inside that call
+        # (redundant with root_used above, but cheap and harmless) since
+        # it always derives mat_path fresh from mat_info's own "matPath"
+        # key regardless of caller.
+        # use_mat_dds_paths=False: mat_info here is ALREADY entirely
+        # .mat-sourced (read_mat_full() above, no json involved in this
+        # pipeline at all) -- the True default exists for ops/
+        # import_cha.py's json+.mat merge (see get_or_create_material()'s
+        # docstring); running it here would just redundantly re-parse
+        # this same .mat file a second time to merge .mat data into
+        # already-.mat data, no-op but wasteful.
+        missing_assets = []
         material = get_or_create_material(
-            root_used, mat_name, summary.derived, mat_info, object_name=object_name,
+            primary_dir, legacy_dir, mat_name, summary.derived, mat_info, object_name=object_name,
+            use_mat_dds_paths=False, missing_assets=missing_assets,
         )
-    except ValueError as exc:
+    except UnrecognizedDerivedTypeError as exc:
         # DERIVED_CONFIGS doesn't cover this type at all (distinct from
         # the KNOWN_UNBUILT_DERIVED bucket above, which is caught
         # earlier -- this is a genuinely unrecognized <Derived> value).
+        # A specific exception type, not a plain ValueError -- see
+        # UnrecognizedDerivedTypeError's own docstring for why that
+        # distinction matters here specifically.
         return None, MaterialProcessResult(mat_name, "unbuilt_type", str(exc))
     except Exception as exc:  # noqa: BLE001 -- defensive, mirrors migrate_shaders.py
         return None, MaterialProcessResult(mat_name, "error", str(exc))
 
-    return material, MaterialProcessResult(mat_name, "built")
+    return material, MaterialProcessResult(mat_name, "built", missing_assets=missing_assets)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +282,10 @@ def _summarize_and_report(operator, results):
     not_found = [r.name for r in results if r.status == "not_found"]
     unbuilt = [(r.name, r.detail) for r in results if r.status == "unbuilt_type"]
     errors = [(r.name, r.detail) for r in results if r.status == "error"]
+    # (mat_name, relative_path) pairs across every "built" result -- see
+    # MaterialProcessResult's own docstring re: "built" not guaranteeing
+    # every texture was actually found (soft-fail, not an error).
+    missing_assets = [pair for r in results for pair in r.missing_assets]
 
     for name in not_found:
         print(f"[SWTOR materials-by-name] No matching .mat file found for '{name}'")
@@ -255,18 +293,24 @@ def _summarize_and_report(operator, results):
         print(f"[SWTOR materials-by-name] '{name}' is a recognized but not-yet-supported shader type ({derived})")
     for name, err in errors:
         print(f"[SWTOR materials-by-name] Failed to process '{name}': {err}")
+    if missing_assets:
+        print(f"[SWTOR materials-by-name] {len(missing_assets)} texture(s) couldn't be found under either Resources Directory:")
+        for mat_name, rel_path in missing_assets:
+            print(f"[SWTOR materials-by-name]   - '{mat_name}': {rel_path}")
 
     msg = f"Built {built} material(s), {already_built + skip_listed} already/deliberately skipped"
     if not_found:
         msg += f", {len(not_found)} with no matching .mat file (see console)"
     if unbuilt:
         msg += f", {len(unbuilt)} of a not-yet-supported type (see console)"
+    if missing_assets:
+        msg += f", {len(missing_assets)} texture(s) not found under either Resources Directory (see console)"
     if errors:
         msg += f", {len(errors)} failed (see console)"
 
     if errors:
         operator.report({'ERROR'}, msg)
-    elif not_found or unbuilt:
+    elif not_found or unbuilt or missing_assets:
         operator.report({'WARNING'}, msg)
     else:
         operator.report({'INFO'}, msg)
@@ -294,19 +338,40 @@ class SWTOR_OT_apply_materials_by_name(bpy.types.Operator):
         object_name = context.active_object.name if context.active_object else None
         result = apply_materials_by_name_to_materials([(material, object_name)])[0]
 
+        # result.name (not material.name) throughout: get_or_create_
+        # material() may have replaced/deleted the original `material`
+        # datablock (see its own docstring -- a same-named-but-not-ours
+        # material gets user_remap()'d and removed), so `material` can be
+        # a stale reference by this point. result.name was captured as a
+        # plain string BEFORE that could happen (see
+        # apply_materials_by_name_to_materials()), so it's always safe.
         if result.status == "built":
-            self.report({'INFO'}, f"Built native SWTOR shader for '{material.name}'")
+            if result.missing_assets:
+                preview = ", ".join(rel_path for _, rel_path in result.missing_assets[:5])
+                remainder = len(result.missing_assets) - 5
+                if remainder > 0:
+                    preview += f", and {remainder} more"
+                self.report(
+                    {'WARNING'},
+                    f"Built native SWTOR shader for '{result.name}', but {len(result.missing_assets)} "
+                    f"texture(s) couldn't be found under either Resources Directory: {preview}",
+                )
+                print(f"[SWTOR materials-by-name] Built '{result.name}', but {len(result.missing_assets)} texture(s) couldn't be found under either Resources Directory:")
+                for _, rel_path in result.missing_assets:
+                    print(f"[SWTOR materials-by-name]   - {rel_path}")
+            else:
+                self.report({'INFO'}, f"Built native SWTOR shader for '{result.name}'")
         elif result.status == "skipped":
             if result.detail == "skip-listed name":
-                self.report({'INFO'}, f"Skipped: '{material.name}' is not a valid .mat file name")
+                self.report({'INFO'}, f"Skipped: '{result.name}' is not a valid .mat file name")
             else:
-                self.report({'INFO'}, f"'{material.name}' already has a native SWTOR shader")
+                self.report({'INFO'}, f"'{result.name}' already has a native SWTOR shader")
         elif result.status == "not_found":
-            self.report({'WARNING'}, f"No matching .mat file found for '{material.name}'")
+            self.report({'WARNING'}, f"No matching .mat file found for '{result.name}'")
         elif result.status == "unbuilt_type":
-            self.report({'WARNING'}, f"'{material.name}' is a recognized but not-yet-supported shader type ({result.detail})")
+            self.report({'WARNING'}, f"'{result.name}' is a recognized but not-yet-supported shader type ({result.detail})")
         else:
-            self.report({'ERROR'}, f"Failed to process '{material.name}': {result.detail}")
+            self.report({'ERROR'}, f"Failed to process '{result.name}': {result.detail}")
 
         return {'FINISHED'}
 
