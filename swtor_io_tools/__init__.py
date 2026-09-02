@@ -3,7 +3,7 @@
 bl_info = {
     "name": "SWTOR: Import/Export Tools",
     "author": "Crunch, Darth Atroxa, SWTOR Slicers",
-    "version": (5, 1, 3),
+    "version": (5, 1, 5),
     "blender": (4, 5, 0),
     "location": "File > Import-Export",
     "description": "Import SWTOR GR2, JBA, CLO Files, and Export SWTOR Compatible GR2 Files",
@@ -28,6 +28,7 @@ from .addon_prefs import Prefs
 
 from .ops.export_gr2             import ExportGR2
 from .ops.import_area             import ImportAREA
+from .ops.import_fxspec           import ImportFXSPEC
 from .ops.import_gr2             import ImportGR2
 from .ops.import_cha             import ImportCHA
 from .ops.import_clo             import ImportCLO
@@ -110,6 +111,10 @@ def _import_area(self, _context):
     # type: (Menu, Context) -> None
     self.layout.operator(ImportAREA.bl_idname, text="SWTOR Area Assembler (.json) - BETA")
 
+def _import_fxspec(self, _context):
+    # type: (Menu, Context) -> None
+    self.layout.operator(ImportFXSPEC.bl_idname, text="SWTOR FX Spec (.fxspec) - BETA")
+
 def _import_gr2(self, _context):
     # type: (Menu, Context) -> None
     self.layout.operator(ImportGR2.bl_idname, text="SWTOR Objects and Skeletons (.gr2 32/64-bit)")
@@ -144,6 +149,7 @@ classes = (
     ImportAREA,
     ImportCHA,
     ImportCLO,
+    ImportFXSPEC,
     ImportGR2,
     ImportJBA,
     NODE_OT_ngroup_edit,
@@ -193,6 +199,7 @@ def register():
     TOPBAR_MT_file_import.append(_import_cha)
     TOPBAR_MT_file_import.append(_import_clo)
     TOPBAR_MT_file_import.append(_import_area)
+    TOPBAR_MT_file_import.append(_import_fxspec)
     
     TOPBAR_MT_file_export.append(_export_gr2)
 
@@ -249,6 +256,7 @@ def unregister():
     keymaps.clear()
 
     from bpy.types import TOPBAR_MT_file_export, TOPBAR_MT_file_import
+    TOPBAR_MT_file_import.remove(_import_fxspec)
     TOPBAR_MT_file_import.remove(_import_area)
     TOPBAR_MT_file_import.remove(_import_cha)
     TOPBAR_MT_file_import.remove(_import_clo)

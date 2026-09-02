@@ -37,6 +37,14 @@ from .process_materials import apply_materials_by_name_to_gr2_objects, _summariz
 from ..types import area as area_types
 from ..types.shared import job_results
 
+# NOTE: ops/import_fxspec.py is deliberately NOT imported at module
+# level here -- it imports _MeshCache/_job_results_key FROM this module,
+# so a top-level import here would create an import cycle
+# (import_area -> import_fxspec -> import_area). Same deferred-import
+# pattern already used between ops/import_gr2.py and
+# ops/process_materials.py -- see _process_fxspec_element's own
+# function-local import instead.
+
 
 # ---------------------------------------------------------------------------
 # Scope (handoff §2a)
@@ -159,9 +167,9 @@ def _filter_excluded_objects(objects, skip_game_engine_objects, skip_counts):
     for ob in objects:
         reason = None
         if ob.name.lower().startswith(DBO_FILENAME_PREFIX):
-            reason = "'dbo*'-named object(s) skipped (Skip Game Engine Objects)"
+            reason = "'dbo*'-named object(s) skipped (Skip Game Engine Objects) (expected)"
         elif _has_excluded_material(ob):
-            reason = "object(s) using a known non-visual utility material skipped (e.g. occluder/portal/collision)"
+            reason = "object(s) using a known non-visual utility material skipped (e.g. occluder/portal/collision) (expected)"
 
         if reason is not None:
             skip_counts[reason] += 1
@@ -713,7 +721,7 @@ def _process_element(operator, context, resources_root, mesh_cache, light_cache,
         # just a marker to place a generic light, not a real asset on
         # disk we read (see _LightCache's own note on why).
         if not operator.area_create_lights:
-            skip_counts["'.lit' skipped (Create Scene Lights disabled)"] += 1
+            skip_counts["'.lit' skipped (Create Scene Lights disabled) (expected)"] += 1
             return []
         light_ob = bpy.data.objects.new(light_cache.object_name(), light_cache.get())
         _apply_transform(light_ob, transform)
@@ -729,7 +737,7 @@ def _process_element(operator, context, resources_root, mesh_cache, light_cache,
 
     if extension not in BUILDABLE_EXTENSIONS:
         if extension in IN_SCOPE_EXTENSIONS:
-            skip_counts["'.%s' -- in scope, importer not built yet" % extension] += 1
+            skip_counts["'.%s' -- in scope, importer not built yet (expected)" % extension] += 1
         # else: genuinely out of scope (§2a) -- not counted, not warned.
         return []
 
@@ -843,8 +851,149 @@ def _process_terrain_element(operator, context, resources_root, element, transfo
     return imported_objects
 
 
-def _process_area_element(operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor, skip_counts):
-    # type: (Any, Any, str, _MeshCache, _LightCache, area_types.AreaElement, area_types.ResolvedTransform, float, Counter) -> list
+def _process_fxspec_element(operator, context, resources_root, element, transform, scale_factor,
+                             fxspec_mesh_cache, fxspec_bone_follower_cache, skip_counts, fxspec_warnings):
+    # type: (Any, Any, str, area_types.AreaElement, area_types.ResolvedTransform, float, _MeshCache, dict, Counter, list) -> list
+    """
+    Handles one direct `.fxp` AreaElement -- Case 1 of the fxspec/area
+    integration handoff (element.asset_name itself authors the fx spec
+    via element.fx_spec_name; a `.fxp` reached indirectly through a
+    `.spn_p` -> `.dyn` expansion, Case 2, isn't routed here at all --
+    see _process_area_element's own dispatch -- it still falls through
+    to _process_element()'s generic "in scope, importer not built yet"
+    skip, unchanged, deferred to its own future session).
+
+    Builds a plain anchor Empty for this element, placed via the exact
+    same _apply_transform() every other element type in this module
+    already uses -- no new transform logic here at all -- then hangs
+    the referenced .fxspec file's own resolved attach graph off that
+    anchor via build_fxspec_graph(..., caster_object=anchor). See that
+    function's own docstring for the caster_object mechanism.
+
+    scale_factor handling: `fxspec_mesh_cache` is a DEDICATED cache,
+    separate from this module's own main `mesh_cache` -- constructed at
+    scale_factor=1.0 in ImportAREA.execute() (see its own comment for
+    why). Sharing the main, real-scale_factor mesh_cache here instead
+    would double-bake scale_factor: once into that cache's own cached
+    vertex data, with nothing in the fxspec attach graph's own local
+    offsets ever otherwise scaled to match, since caster_object bypasses
+    build_fxspec_graph's root-bake entirely (see that function's own
+    docstring). Instead, scale_factor is multiplied directly onto the
+    anchor's own Object.scale, right after placing it -- ordinary
+    Blender parent-child composition then carries that scale down
+    through every graph entry's own local offset AND onto this
+    dedicated cache's raw, unscaled .gr2 geometry uniformly, mirroring
+    the standalone importer's own root-bake via a different (but
+    equivalent) mechanism.
+
+    `armature_ob` is always None here -- no skeleton exists in area
+    context, so every entry that authors a bone name falls through
+    build_fxspec_graph's existing "bone not found, treat as CASTER/
+    TARGET" warning path, same as it would for any standalone import
+    with no Armature selected. `import_all_empties` is hardcoded False
+    -- area imports already produce a lot of objects across potentially
+    hundreds of elements, so "only essential anchors" seems even more
+    valuable here than in the standalone case (Crunch's own call,
+    flagged as a leaning rather than a hard requirement -- worth
+    revisiting as a real ImportAREA toggle later if it's actually
+    wanted).
+
+    `fxspec_warnings` collects raw per-entry warning detail across the
+    WHOLE BATCH for one console dump at the end of ImportAREA.execute()
+    -- but only for the "actionable" warning categories (a missing/
+    empty .gr2, or a malformed attach chain -- see
+    FXSPEC_ACTIONABLE_CATEGORIES below), where knowing exactly WHICH
+    entry/file triggered it is worth the console space. Every warning
+    category, actionable or not, is also counted into skip_counts under
+    its own stable label (FXSPEC_WARNING_LABELS) -- this is the real
+    fix for the original "one big undifferentiated bucket" version:
+    the previously-benign-but-noisy categories (no Armature in area
+    context, a real particle emitter Phase 1 doesn't build, a
+    non-essential dummy skipped) fire on a large fraction of entries in
+    a typical .fxspec, in every instance, across a whole area -- dumping
+    all of that raw looked like a wall of errors even though almost
+    none of it needed investigating. Those three categories now only
+    ever show up as a skip_counts number, not a console line each.
+    """
+    # Deferred import -- see this module's own top-of-file note.
+    from .import_fxspec import (
+        build_fxspec_graph,
+        WARN_NO_ARMATURE_BONE, WARN_GR2_NOT_FOUND, WARN_GR2_NO_OBJECTS,
+        WARN_DANGLING_REFERENCE, WARN_CHAIN_CYCLE,
+        WARN_REAL_EMITTER_SKIPPED, WARN_NON_ESSENTIAL_DUMMY_SKIPPED,
+    )
+    from ..types import fxspec as fxspec_types
+
+    FXSPEC_WARNING_LABELS = {
+        WARN_NO_ARMATURE_BONE: "'.fxspec' -- bone authored, no Armature in area context, anchored at element origin (expected)",
+        WARN_GR2_NOT_FOUND: "'.fxspec' -- referenced .gr2 not found on disk",
+        WARN_GR2_NO_OBJECTS: "'.fxspec' -- referenced .gr2 importer produced no objects",
+        WARN_DANGLING_REFERENCE: "'.fxspec' -- attach chain references an unresolved entry",
+        WARN_CHAIN_CYCLE: "'.fxspec' -- attach chain cycles back on itself",
+        WARN_REAL_EMITTER_SKIPPED: "'.fxspec' -- real particle emitter skipped, not built yet (expected)",
+        WARN_NON_ESSENTIAL_DUMMY_SKIPPED: "'.fxspec' -- dummy/anchor skipped, nothing attaches through it (expected)",
+    }
+    # Categories worth a specific console line (which entry, which
+    # resource) because they indicate something an individual .fxspec
+    # or .gr2 file actually got wrong, not just Phase-1-scope/area-
+    # context housekeeping. Everything else still gets counted above,
+    # just without per-entry detail.
+    FXSPEC_ACTIONABLE_CATEGORIES = {
+        WARN_GR2_NOT_FOUND, WARN_GR2_NO_OBJECTS, WARN_DANGLING_REFERENCE, WARN_CHAIN_CYCLE,
+    }
+
+    def _on_warn(category, message):
+        skip_counts[FXSPEC_WARNING_LABELS.get(category, "'.fxspec' -- other warning")] += 1
+        if category in FXSPEC_ACTIONABLE_CATEGORIES:
+            fxspec_warnings.append('"%s": %s' % (element.fx_spec_name, message))
+
+    if not element.fx_spec_name:
+        skip_counts["'.fxp' element missing fx.fxSpecName -- skipped"] += 1
+        return []
+
+    resolved_path = resolve_resource_path(resources_root, element.fx_spec_name)
+    if resolved_path is None or not os.path.isfile(resolved_path):
+        skip_counts["'.fxspec' file not found on disk"] += 1
+        return []
+
+    try:
+        with open(resolved_path, 'rb') as f:
+            raw_bytes = f.read()
+        root_node = fxspec_types.parse_fxspec(raw_bytes)
+    except (fxspec_types.FxSpecParseError, OSError) as exc:
+        skip_counts["'.fxspec' failed to parse"] += 1
+        fxspec_warnings.append('"%s" -- failed to parse: %s' % (element.fx_spec_name, exc))
+        return []
+
+    # Named from the RESOLVED on-disk path's own stem, not
+    # element.fx_spec_name directly -- that field is a raw backslash-
+    # delimited SWTOR asset path (e.g.
+    # "\art\fx\fxspec\mtx\mtx_item_republic_banner.fxspec"), which
+    # pathlib would misparse on a non-Windows host (no backslash
+    # path-separator handling on POSIX) -- resolved_path has already
+    # been through resolve_resource_path()'s own OS-correct
+    # normalization, same convention ImportFXSPEC.execute() already
+    # uses for its own display_name.
+    anchor = bpy.data.objects.new(Path(resolved_path).stem, None)
+    anchor.empty_display_type = 'PLAIN_AXES'
+    anchor.empty_display_size = 0.1
+    context.collection.objects.link(anchor)
+    _apply_transform(anchor, transform)
+    # Structural scale_factor bake -- see this function's own docstring.
+    anchor.scale = tuple(s * scale_factor for s in anchor.scale)
+
+    built = build_fxspec_graph(
+        operator, context, resources_root, root_node, context.collection,
+        fxspec_mesh_cache, scale_factor, None, fxspec_bone_follower_cache,
+        False, _on_warn, caster_object=anchor,
+    )
+
+    return [anchor] + list(built.values())
+
+
+def _process_area_element(operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor,
+                           skip_counts, fxspec_mesh_cache, fxspec_bone_follower_cache, fxspec_warnings):
+    # type: (Any, Any, str, _MeshCache, _LightCache, area_types.AreaElement, area_types.ResolvedTransform, float, Counter, _MeshCache, dict, list) -> list
     """
     Handles one parsed AreaElement with its already-computed final
     transform: resolves ".spn_p" indirection if present (possibly
@@ -860,6 +1009,21 @@ def _process_area_element(operator, context, resources_root, mesh_cache, light_c
 
     if asset_name.lower().endswith(".hms"):
         return _process_terrain_element(operator, context, resources_root, element, transform, scale_factor, skip_counts)
+
+    if asset_name.lower().endswith(".fxp"):
+        # Case 1 only (see _process_fxspec_element's own docstring) --
+        # intercepted here, one level up from _process_element(), since
+        # that's where `element` (and therefore element.fx_spec_name)
+        # is still in scope. A `.fxp` reached via `.spn_p` -> `.dyn`
+        # expansion (Case 2) never reaches this branch at all -- it's a
+        # synthetic DynVisual path string by the time it would get here,
+        # not an AreaElement -- and still falls through to
+        # _process_element()'s own generic extension dispatch below,
+        # unchanged.
+        return _process_fxspec_element(
+            operator, context, resources_root, element, transform, scale_factor,
+            fxspec_mesh_cache, fxspec_bone_follower_cache, skip_counts, fxspec_warnings,
+        )
 
     if not asset_name.lower().endswith(".spn_p"):
         return _process_element(
@@ -932,8 +1096,9 @@ def _process_area_element(operator, context, resources_root, mesh_cache, light_c
 # Orchestrator + Operator
 # ---------------------------------------------------------------------------
 
-def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, light_budget):
-    # type: (Any, Any, str, str, float, _MeshCache, _LightBudget) -> bool
+def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, light_budget,
+         fxspec_mesh_cache, fxspec_bone_follower_cache):
+    # type: (Any, Any, str, str, float, _MeshCache, _LightBudget, _MeshCache, dict) -> bool
     """
     Imports ONE area json file. Assumes `resources_root` is already a
     valid directory and bundled_data/ is already confirmed available --
@@ -954,6 +1119,14 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
     >100-lights safeguard only means anything if it's tracking the
     running total across the whole batch (see _LightBudget's own note
     on why a per-file-only check doesn't catch the actual failure mode).
+
+    `fxspec_mesh_cache` and `fxspec_bone_follower_cache` are `.fxp`
+    elements' own dedicated equivalents -- likewise shared across the
+    whole batch (a reused vfx model, e.g. the same banner prop across
+    many rooms in one zone, benefits from the same dedup) -- see
+    _process_fxspec_element's own docstring for why they're kept
+    separate from this function's own `mesh_cache` rather than reusing
+    it directly.
 
     Returns True on success, False on failure (mirrors
     import_gr2.py/import_cha.py's own load() return convention).
@@ -983,67 +1156,103 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
     # that produces zero objects (e.g. a pure-logic file with no
     # .gr2/.spn_p content at all), leaving a pointless empty Collection
     # pair behind every time.
-    root_collection = None
-    objects_collection = None
-    empties_collection = None
-    lights_collection = None
-    heightmaps_collection = None
+    #
+    # "Organized Collections" (area_organized_collections) splits
+    # non-Light/non-Heightmap objects into three top-level categories --
+    # General (direct .gr2/.mag/.spt content), SPN/DYN (.spn_p ->
+    # .dyn-expanded content), and FX (.fxp -> .fxspec-expanded content)
+    # -- each its own parent Collection with "... Objects"/"... Empties"
+    # children, so e.g. every FX-origin object in an area is selectable/
+    # hideable as one group rather than mixed in among everything else
+    # by ob.type alone. Lights and Heightmaps are deliberately NOT
+    # folded into this scheme -- both are always direct elements in the
+    # current scope (never reached via .spn_p or .fxp), so an "FX
+    # Lights" or "SPN/DYN Heightmaps" collection could never actually
+    # hold anything; they stay exactly where they've always been.
+    #
+    # Off, this reproduces the add-on's original flat behaviour -- a
+    # plain "<Area Name> - Objects"/"<Area Name> - Empties" split, no
+    # per-category distinction -- with SPN/DYN and FX content simply
+    # mixed in among "general" content by ob.type, same as before this
+    # feature existed at all.
+    _collections = {}  # name -> Collection, created lazily on first use
+
+    def _ensure_collection(name, parent):
+        # type: (str, bpy.types.Collection) -> bpy.types.Collection
+        col = _collections.get(name)
+        if col is None:
+            col = bpy.data.collections.new(name)
+            parent.children.link(col)
+            _collections[name] = col
+        return col
 
     def _ensure_root_collection():
-        nonlocal root_collection
-        if root_collection is None:
-            root_collection = bpy.data.collections.new(area_name)
-            context.scene.collection.children.link(root_collection)
-        return root_collection
-
-    def _ensure_objects_collection():
-        nonlocal objects_collection
-        if objects_collection is None:
-            root = _ensure_root_collection()
-            if operator.area_separate_collections:
-                objects_collection = bpy.data.collections.new("%s - Objects" % area_name)
-                root.children.link(objects_collection)
-            else:
-                objects_collection = root
-        return objects_collection
-
-    def _ensure_empties_collection():
-        nonlocal empties_collection
-        if empties_collection is None:
-            if operator.area_separate_empties_collection:
-                root = _ensure_root_collection()
-                empties_collection = bpy.data.collections.new("%s - Empties" % area_name)
-                root.children.link(empties_collection)
-            else:
-                empties_collection = _ensure_objects_collection()
-        return empties_collection
+        return _ensure_collection(area_name, context.scene.collection)
 
     def _ensure_lights_collection():
-        nonlocal lights_collection
-        if lights_collection is None:
-            root = _ensure_root_collection()
-            lights_collection = bpy.data.collections.new("%s - Lights" % area_name)
-            root.children.link(lights_collection)
-        return lights_collection
+        return _ensure_collection("%s - Lights" % area_name, _ensure_root_collection())
 
     def _ensure_heightmaps_collection():
-        nonlocal heightmaps_collection
-        if heightmaps_collection is None:
-            root = _ensure_root_collection()
-            heightmaps_collection = bpy.data.collections.new("%s - Heightmaps" % area_name)
-            root.children.link(heightmaps_collection)
-        return heightmaps_collection
+        return _ensure_collection("%s - Heightmaps" % area_name, _ensure_root_collection())
+
+    _CATEGORY_LABELS = {"general": "General", "spn_dyn": "SPN/DYN", "fx": "FX"}
+
+    def _ensure_leaf_collection(category, is_empty):
+        # type: (str, bool) -> bpy.types.Collection
+        """
+        Resolves the target collection for a non-Light, non-Heightmap
+        object, based on its originating element's category (`category`,
+        one of "general"/"spn_dyn"/"fx" -- see _element_category()) and
+        whether the object itself is an Empty. With Organized Collections
+        off, reproduces this add-on's original flat behaviour -- a plain
+        "<Area Name> - Objects" and "<Area Name> - Empties" split, no
+        per-category distinction -- unconditionally now; this used to be
+        gated behind its own two toggles (Separate Objects/Empties
+        Collection), removed as redundant once Organized Collections
+        covers the "I want this split up" case properly -- both defaulted
+        to True anyway, so this is the effective behaviour either way,
+        just without the now-pointless option to turn it off.
+        """
+        root = _ensure_root_collection()
+
+        if not operator.area_organized_collections:
+            if is_empty:
+                return _ensure_collection("%s - Empties" % area_name, root)
+            return _ensure_collection("%s - Objects" % area_name, root)
+
+        label = _CATEGORY_LABELS[category]
+        category_parent = _ensure_collection("%s - %s" % (area_name, label), root)
+        leaf_name = "%s - %s %s" % (area_name, label, "Empties" if is_empty else "Objects")
+        return _ensure_collection(leaf_name, category_parent)
+
+    def _element_category(element):
+        # type: (area_types.AreaElement) -> str
+        """
+        "general"/"spn_dyn"/"fx" per _ensure_leaf_collection above.
+        Deliberately doesn't handle ".hms" -- heightmap routing happens
+        earlier, unconditionally, before this is ever consulted (see
+        the per-object loop below).
+        """
+        name = element.asset_name.lower()
+        if name.endswith(".fxp"):
+            return "fx"
+        if name.endswith(".spn_p"):
+            return "spn_dyn"
+        return "general"
 
     light_cache = _LightCache(area_name, scale_factor)
 
     skip_counts = Counter()
     crashed_elements = []
     total_objects = []
+    fxspec_warnings = []
 
     for element in elements:
         transform = transforms.get(element.id)
         if transform is None:
             continue
+
+        element_category = _element_category(element)
 
         # One malformed/unexpected element (e.g. a resolved .gr2 the
         # underlying importer chokes on) shouldn't take down an import
@@ -1053,7 +1262,8 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
         # importing the rest" handling.
         try:
             objects = _process_area_element(
-                operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor, skip_counts,
+                operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor,
+                skip_counts, fxspec_mesh_cache, fxspec_bone_follower_cache, fxspec_warnings,
             )
         except Exception as exc:
             crashed_elements.append("%s (%s): %s" % (element.id, element.asset_name, exc))
@@ -1087,25 +1297,21 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
             # there's no per-object signal to key off; this element
             # produced terrain, so every object it returned is terrain.
             #
-            # Organizational Empties (grouping .dyn-expanded visuals)
-            # route to their own collection when area_separate_empties_collection
-            # is on, same reasoning as area_separate_collections for
-            # regular mesh objects -- kept as a separate toggle since
-            # someone may want mesh objects grouped but not care about
-            # a dedicated Empties collection, or vice versa. Lights and
-            # Heightmaps always get their own collection when any exist
-            # (unlike Objects/Empties, not gated behind a
-            # grouping-preference toggle) -- but, like Objects/Empties,
-            # still created lazily, so a file with none of a given kind
-            # doesn't leave a pointless empty collection behind.
+            # Everything else routes through _ensure_leaf_collection(),
+            # keyed on this element's own category (general/spn_dyn/fx --
+            # see _element_category) plus whether the object itself is
+            # an Empty -- see that function's own docstring for how it
+            # collapses back to the add-on's previous flat behaviour
+            # when Organized Collections is off. Lights always go to
+            # their own collection regardless of category -- see the
+            # collection-helpers' own comment on why Lights/Heightmaps
+            # never participate in the general/spn_dyn/fx split at all.
             if element.asset_name.lower().endswith(".hms"):
                 target_collection = _ensure_heightmaps_collection()
-            elif ob.type == 'EMPTY':
-                target_collection = _ensure_empties_collection()
             elif ob.type == 'LIGHT':
                 target_collection = _ensure_lights_collection()
             else:
-                target_collection = _ensure_objects_collection()
+                target_collection = _ensure_leaf_collection(element_category, ob.type == 'EMPTY')
             if target_collection not in ob.users_collection:
                 target_collection.objects.link(ob)
             for existing in list(ob.users_collection):
@@ -1117,16 +1323,17 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
     # file in this execute() call), not checked against a per-file
     # threshold here -- see _LightBudget's own note on why a per-file
     # check doesn't catch the actual failure mode this exists for.
-    light_budget.register(context, lights_collection)
+    light_budget.register(context, _collections.get("%s - Lights" % area_name))
 
+    root_collection = _collections.get(area_name)
     if operator.area_hide_collections_after_import and root_collection is not None:
         # Excluding the ROOT collection is enough -- Blender's view-layer
-        # exclusion cascades to every child collection (Objects/Empties/
-        # Lights/Heightmaps) automatically, same reasoning confirmed
-        # already for the light-count safeguard, just applied to the
-        # whole area here instead of only its Lights collection. No
-        # per-file threshold or cumulative state needed (unlike
-        # _LightBudget) -- this is a plain per-file toggle, not
+        # exclusion cascades to every child collection (General/SPN-DYN/
+        # FX/Lights/Heightmaps, and each of THEIR own children) automatically,
+        # same reasoning confirmed already for the light-count safeguard,
+        # just applied to the whole area here instead of only its Lights
+        # collection. No per-file threshold or cumulative state needed
+        # (unlike _LightBudget) -- this is a plain per-file toggle, not
         # something that only matters once a running total crosses a
         # threshold, so it's applied directly here rather than through
         # any shared batch-wide object.
@@ -1151,6 +1358,20 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
         for w in transform_warnings[:20]:
             print("  " + w)
 
+    if fxspec_warnings:
+        # Only the "actionable" categories land here now (a missing/
+        # empty .gr2, a malformed attach chain, or a parse failure) --
+        # see _process_fxspec_element's own FXSPEC_ACTIONABLE_CATEGORIES.
+        # Every category, actionable or not, is ALSO already counted
+        # into skip_counts below under its own stable label -- this is
+        # just the extra per-entry/per-file detail for the categories
+        # actually worth digging into.
+        print("Area Assembler [%s]: %d .fxspec warning(s) needing attention:" % (file_label, len(fxspec_warnings)))
+        for w in fxspec_warnings[:20]:
+            print("  " + w)
+        if len(fxspec_warnings) > 20:
+            print("  ... and %d more (see full console output)" % (len(fxspec_warnings) - 20))
+
     if skip_counts:
         print("Area Assembler [%s]: elements skipped, by reason:" % file_label)
         for reason, count in skip_counts.most_common():
@@ -1169,7 +1390,25 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
             parts.append("%d element(s) skipped across %d reason(s)" % (sum(skip_counts.values()), len(skip_counts)))
         if crashed_elements:
             parts.append("%d element(s) raised an error" % len(crashed_elements))
-        operator.report({'WARNING'}, "[%s] " % file_label + "; ".join(parts) + " -- see console for details.")
+        message = "[%s] " % file_label + "; ".join(parts) + " -- see console for details."
+
+        # Same tiering as process_materials.py's own _summarize_and_report()
+        # -- ERROR if something actually crashed, WARNING if any skip
+        # reason isn't tagged "(expected)" (a genuinely deliberate,
+        # by-design skip -- a disabled toggle, Phase 1 scope, no Armature
+        # in area context, etc.), INFO if every single skip reason is
+        # expected and nothing crashed. Confirmed real problem with the
+        # previous unconditional WARNING here: a totally ordinary area
+        # full of e.g. Skip Game Engine Objects exclusions and
+        # not-yet-built extensions read as if something had gone wrong
+        # on every single import.
+        needs_attention = any("(expected)" not in reason for reason in skip_counts)
+        if crashed_elements:
+            operator.report({'ERROR'}, message)
+        elif needs_attention:
+            operator.report({'WARNING'}, message)
+        else:
+            operator.report({'INFO'}, message)
 
     # Matches the old importer's own "FILE:/OBJS:/TIME:" console
     # convention (and import_gr2.py's own per-file timing) -- confirmed
@@ -1215,11 +1454,18 @@ class ImportAREA(bpy.types.Operator):
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
-    area_separate_collections: bpy.props.BoolProperty(
-        name="Separate Objects Collection",
+    area_organized_collections: bpy.props.BoolProperty(
+        name="Organized Collections",
         description=(
-            "Nests all imported objects in a child \"<Area Name> - Objects\" "
-            "Collection instead of directly in the area's root Collection"
+            "Splits imported objects into three top-level Collections -- "
+            "\"<Area Name> - General\" (direct meshes), \"<Area Name> - SPN/DYN\" "
+            "(resolved .spn_p placeables), and \"<Area Name> - FX\" (resolved "
+            ".fxspec visual effects) -- each with its own \"... Objects\"/"
+            "\"... Empties\" child Collections, so each category is selectable/"
+            "hideable as a group. Off, imports into a plain \"<Area Name> - "
+            "Objects\"/\"<Area Name> - Empties\" split instead, no per-category "
+            "distinction. Lights and Heightmaps are unaffected either way -- "
+            "they always get their own Collection"
         ),
         default=True,
     )
@@ -1288,16 +1534,6 @@ class ImportAREA(bpy.types.Operator):
             "see it again"
         ),
         default=False,
-    )
-
-    area_separate_empties_collection: bpy.props.BoolProperty(
-        name="Separate Empties Collection",
-        description=(
-            "Nests organizational Empties (grouping each .dyn-expanded "
-            "placeable's resulting objects) in a child \"<Area Name> - Empties\" "
-            "Collection instead of alongside regular mesh objects"
-        ),
-        default=True,
     )
 
     area_open_console: bpy.props.BoolProperty(
@@ -1384,11 +1620,23 @@ class ImportAREA(bpy.types.Operator):
         mesh_cache = _MeshCache(scale_factor=scale_factor)
         light_budget = _LightBudget(LIGHT_COUNT_AUTO_EXCLUDE_THRESHOLD)
 
+        # `.fxp` elements' own dedicated equivalents -- deliberately
+        # scale_factor=1.0 (NOT the real scale_factor above) and kept
+        # separate from this batch's main mesh_cache -- see
+        # _process_fxspec_element's own docstring for why sharing the
+        # main, real-scale_factor cache would double-bake scale_factor.
+        # Shared across the WHOLE BATCH, same lifetime as mesh_cache --
+        # a reused vfx model (e.g. the same banner prop across many
+        # rooms in one zone) benefits from the same cross-file dedup.
+        fxspec_mesh_cache = _MeshCache(scale_factor=1.0)
+        fxspec_bone_follower_cache = {}
+
         batch_start_time = time.time()
         succeeded = []
         failed = []
         for path in paths:
-            if load(self, context, path, resources_root, scale_factor, mesh_cache, light_budget):
+            if load(self, context, path, resources_root, scale_factor, mesh_cache, light_budget,
+                    fxspec_mesh_cache, fxspec_bone_follower_cache):
                 succeeded.append(path)
             else:
                 failed.append(path)
