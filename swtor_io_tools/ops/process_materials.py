@@ -20,16 +20,13 @@ Two entry points share this module's pipeline:
 Both funnel through _build_named_material(): Tier 1 (types/mat.py's
 read_mat_summary -- alpha + skip-list + shader-family aliasing) + Tier 2
 (types/mat.py's read_mat_full -- the map/palette adapter) +
-ops/import_cha.py's existing get_or_create_material(), unchanged.
+ops/material_builder.py's existing get_or_create_material(), unchanged.
 
-Deliberately does lazy (function-body), not top-level, imports from
-ops/import_cha.py: import_cha.py imports ops/import_gr2.py's load() at
-module level, and this module is imported by import_gr2.py's load() (to
-call apply_materials_by_name_after_import()) too -- a top-level import
-here would create an import cycle (import_gr2 -> process_materials ->
-import_cha -> import_gr2). Deferred imports sidestep it, since by the
-time any function below actually runs, every module in the cycle has
-already finished loading.
+get_or_create_material() lives in ops/material_builder.py, which imports
+nothing from ops/import_cha.py, ops/import_gr2.py or this module, so it
+is imported normally (top-level) here -- no import cycle, unlike when it
+lived in import_cha.py (import_gr2 -> process_materials -> import_cha ->
+import_gr2).
 """
 
 import json
@@ -37,12 +34,14 @@ from typing import Any, List, Optional, Tuple
 
 import bpy
 
+from .material_builder import UnrecognizedDerivedTypeError, get_or_create_material, is_head_object_name
 from ..types.mat import (
     KNOWN_UNBUILT_DERIVED,
     read_mat_full,
     read_mat_summary,
     resolve_mat_path,
 )
+from ..types.shader_templates import has_swtor_shader_group
 
 
 # ---------------------------------------------------------------------------
@@ -62,9 +61,9 @@ class MaterialProcessResult:
         "not_found"    -- no matching .mat file under either Resources
                           Directory.
         "unbuilt_type" -- resolved to a recognized-but-not-yet-supported
-                          shader type (EmissiveOnly/AnimatedUV, or
-                          something DERIVED_CONFIGS doesn't cover at
-                          all); `detail` names the type.
+                          shader type (KNOWN_UNBUILT_DERIVED, currently
+                          empty, or something DERIVED_CONFIGS doesn't
+                          cover at all); `detail` names the type.
         "error"        -- the .mat file couldn't be parsed, or
                           get_or_create_material() itself raised;
                           `detail` has the message. Never propagates --
@@ -112,9 +111,6 @@ def _build_named_material(mat_name, object_name=None):
     Returns (material, result). material is None unless result.status
     is "built" or "skipped" with detail "already built".
     """
-    from .import_cha import UnrecognizedDerivedTypeError, get_or_create_material
-    from ..types.shader_templates import has_swtor_shader_group
-
     existing = bpy.data.materials.get(mat_name)
     if existing is not None and has_swtor_shader_group(existing):
         return existing, MaterialProcessResult(mat_name, "skipped", "already built")
@@ -141,28 +137,28 @@ def _build_named_material(mat_name, object_name=None):
     if mat_info is None:
         return None, MaterialProcessResult(mat_name, "error", "couldn't parse .mat file")
 
+    existed_before = existing is not None   # a same-named material that wasn't one of ours
+
     try:
         # NOTE: passing primary_dir/legacy_dir here, NOT root_used/None.
         # root_used only tells us where the .mat FILE resolved -- but a
         # material's .dds textures can live under a different root
-        # entirely (confirmed real case, see ops/import_cha.py's
+        # entirely (confirmed real case, see ops/material_builder.py's
         # get_or_create_material() docstring), so its own per-asset
         # fallback needs both real roots to have any effect. The .mat
         # file itself gets re-resolved once more inside that call
         # (redundant with root_used above, but cheap and harmless) since
         # it always derives mat_path fresh from mat_info's own "matPath"
         # key regardless of caller.
-        # use_mat_dds_paths=False: mat_info here is ALREADY entirely
-        # .mat-sourced (read_mat_full() above, no json involved in this
-        # pipeline at all) -- the True default exists for ops/
-        # import_cha.py's json+.mat merge (see get_or_create_material()'s
-        # docstring); running it here would just redundantly re-parse
-        # this same .mat file a second time to merge .mat data into
-        # already-.mat data, no-op but wasteful.
         missing_assets = []
         material = get_or_create_material(
-            primary_dir, legacy_dir, mat_name, summary.derived, mat_info, object_name=object_name,
-            use_mat_dds_paths=False, missing_assets=missing_assets,
+            primary_dir, legacy_dir, mat_name, summary.derived, mat_info,
+            missing_assets=missing_assets,
+            detect_skinb_invert_alpha=is_head_object_name(object_name),
+            # A real .mat routinely omits a map its derived type lists as
+            # required (grass with no GlossMap, ...): leave it at the
+            # template default instead of failing the whole material.
+            strict_required_maps=False,
         )
     except UnrecognizedDerivedTypeError as exc:
         # DERIVED_CONFIGS doesn't cover this type at all (distinct from
@@ -173,9 +169,28 @@ def _build_named_material(mat_name, object_name=None):
         # distinction matters here specifically.
         return None, MaterialProcessResult(mat_name, "unbuilt_type", str(exc))
     except Exception as exc:  # noqa: BLE001 -- defensive, mirrors migrate_shaders.py
+        _discard_partial_material(mat_name, existed_before)
         return None, MaterialProcessResult(mat_name, "error", str(exc))
 
     return material, MaterialProcessResult(mat_name, "built", missing_assets=missing_assets)
+
+
+def _discard_partial_material(mat_name, existed_before):
+    # type: (str, bool) -> None
+    """
+    get_or_create_material() creates the material (with its shader group)
+    BEFORE it loads textures and sets inputs, so an exception part-way leaves
+    a material that has_swtor_shader_group() calls "already built" -- every
+    later request for that name would then be handed the half-built one as a
+    success (or, if a purge swept it first, rebuilt and failed all over
+    again: the outcome depended on timing). Remove what this call created.
+    A pre-existing same-named material (existed_before) is left alone.
+    """
+    if existed_before:
+        return
+    leftover = bpy.data.materials.get(mat_name)
+    if leftover is not None:
+        bpy.data.materials.remove(leftover)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +436,7 @@ class SWTOR_OT_apply_materials_by_name_file(bpy.types.Operator):
 # migrate_shaders.py's swtor_migrate_submenu_element() exactly, except
 # targeting the live menu instead of the deprecated one -- this feature
 # isn't deprecated-adjacent, so, unlike migrate_shaders.py, this module
-# imports Tier 1/Tier 2 (and, lazily, get_or_create_material()) directly
+# imports Tier 1/Tier 2 and get_or_create_material() directly
 # rather than keeping a local duplicate for isolation.
 def swtor_process_materials_submenu_element(self, context):
     # type: (bpy.types.Menu, bpy.types.Context) -> None

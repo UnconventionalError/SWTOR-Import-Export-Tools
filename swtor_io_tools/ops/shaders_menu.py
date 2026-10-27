@@ -3,7 +3,7 @@
 #
 # This is the current system: every shader here is a native SWTOR shader
 # appended from the bundled template .blend (types/shader_templates.py,
-# bundled_data/Atroxa_Shaders.blend) -- no addon-side Python needed to
+# bundled_data/HeroEngine_Shaders.blend) -- no addon-side Python needed to
 # open, render, or edit once saved. The deprecated ShaderNodeHeroEngine
 # custom-node equivalent lives in shaders_menu_deprecated.py.
 #
@@ -33,7 +33,7 @@ from ..types.shader_templates import SHADER_TEMPLATE_MATERIAL_NAMES, get_or_buil
 # already had) is retired -- per Crunch, there's little real need to
 # preserve a material's prior node graph when explicitly choosing a
 # shader type from this menu, and a single consistent replace-and-rename
-# mechanism (shared with import_cha.py and migrate_shaders.py) beats
+# mechanism (shared with material_builder.py and migrate_shaders.py) beats
 # maintaining a second, merge-capable one for this one caller.
 class NODE_OT_add_swtor_shader_group(bpy.types.Operator):
     bl_idname = 'node.add_swtor_shader_group'

@@ -4,7 +4,7 @@
 Shader template delivery -- replaces the old approach of building every
 SWTOR shader's node graph directly via the Python bpy API (see the now-
 retired node_group.py / node_tree.py) with appending fully pre-wired
-materials from a single bundled template .blend (Atroxa_Shaders.blend).
+materials from a single bundled template .blend (HeroEngine_Shaders.blend).
 
 Why materials, not bare node groups: each template material carries not
 just the shader's native node group, but the external Image Texture
@@ -31,7 +31,7 @@ import bpy
 
 class ShaderTemplateError(Exception):
     """
-    Raised when Atroxa_Shaders.blend is missing, or doesn't contain what
+    Raised when HeroEngine_Shaders.blend is missing, or doesn't contain what
     this module expects of it (a named template material, or that
     material lacking any of our own shader group nodes). Both are
     addon-setup/template-integrity problems, not recoverable per-material
@@ -43,12 +43,13 @@ class ShaderTemplateError(Exception):
 # Bundled template .blend
 # ---------------------------------------------------------------------------
 
-TEMPLATE_BLEND_FILENAME = "Atroxa_Shaders.blend"
+TEMPLATE_BLEND_FILENAME = "HeroEngine_Shaders.blend"
 
 # shader_type (matches the old SWTOR_SHADER_GROUPS keys) -> template
-# material name in Atroxa_Shaders.blend.
+# material name in HeroEngine_Shaders.blend.
 SHADER_TEMPLATE_MATERIAL_NAMES = {
     "UBER": "TEMPLATE - Uber Shader",
+    "GRASS": "TEMPLATE - Grass Shader",
     "EYE": "TEMPLATE - Eye Shader",
     "CREATURE": "TEMPLATE - Creature Shader",
     "HAIRC": "TEMPLATE - HairC Shader",
@@ -56,29 +57,33 @@ SHADER_TEMPLATE_MATERIAL_NAMES = {
     "GARMENT": "TEMPLATE - Garment Shader",
     "SKINB": "TEMPLATE - SkinB Shader",
     "ANIMATEDUV": "TEMPLATE - AnimatedUV Shader",
+    "NOSHADETEXFOGGED": "TEMPLATE - NoShadeTexFogged Shader",
+    "VEGETATION": "TEMPLATE - Vegetation Shader",
+    "EMISSIVEONLY": "TEMPLATE - EmissiveOnly Shader",
 }  # type: Dict[str, str]
 
 # shader_type -> that material's own MAIN shader group's exact
 # node_tree name. Kept as an explicit mapping, not derived from
 # SHADER_TEMPLATE_MATERIAL_NAMES by string transformation (e.g.
-# stripping "TEMPLATE - " and prepending a fixed prefix) -- different
-# shader types can credit different authors in their group naming (e.g.
-# AnimatedUV's group briefly considered "CaptnKoda+C3PO SWTOR - X" before
-# settling on "Atroxa SWTOR - X" for now), and there's an ongoing,
-# not-yet-decided discussion about standardizing this further onto a
-# "HeroEngine SWTOR - X" convention -- so this stays a plain per-type
-# lookup rather than assuming any one naming convention holds universally,
-# now or later. Adding a new shader type always means adding an entry
-# here, whatever its group happens to be named in the .blend.
+# stripping "TEMPLATE - " and prepending a fixed prefix) -- the group name
+# is what the code matches against, so it stays a plain per-type lookup
+# that must equal the .blend's own name exactly. Every group now follows
+# the "HeroEngine SWTOR - X" convention. Adding a new shader type always
+# means adding an entry here, whatever its group happens to be named in
+# the .blend.
 SHADER_GROUP_NAMES = {
-    "UBER": "Atroxa SWTOR - Uber Shader",
-    "EYE": "Atroxa SWTOR - Eye Shader",
-    "CREATURE": "Atroxa SWTOR - Creature Shader",
-    "HAIRC": "Atroxa SWTOR - HairC Shader",
-    "HAIRC_MODERN": "Atroxa SWTOR - HairC Modern Shader",
-    "GARMENT": "Atroxa SWTOR - Garment Shader",
-    "SKINB": "Atroxa SWTOR - SkinB Shader",
-    "ANIMATEDUV": "Atroxa SWTOR - AnimatedUV Shader",
+    "UBER": "HeroEngine SWTOR - Uber Shader",
+    "EYE": "HeroEngine SWTOR - Eye Shader",
+    "CREATURE": "HeroEngine SWTOR - Creature Shader",
+    "HAIRC": "HeroEngine SWTOR - HairC Shader",
+    "HAIRC_MODERN": "HeroEngine SWTOR - HairC Modern Shader",
+    "GARMENT": "HeroEngine SWTOR - Garment Shader",
+    "SKINB": "HeroEngine SWTOR - SkinB Shader",
+    "ANIMATEDUV": "HeroEngine SWTOR - AnimatedUV Shader",
+    "GRASS": "HeroEngine SWTOR - Grass Shader",
+    "NOSHADETEXFOGGED": "HeroEngine SWTOR - NoShadeTexFogged Shader",
+    "VEGETATION": "HeroEngine SWTOR - Vegetation Shader",
+    "EMISSIVEONLY": "HeroEngine SWTOR - EmissiveOnly Shader",
 }  # type: Dict[str, str]
 
 
@@ -91,7 +96,7 @@ def _bundled_data_dir():
 def _template_blend_path():
     # type: () -> Path
     """
-    Resolves Atroxa_Shaders.blend's path under bundled_data/, raising
+    Resolves HeroEngine_Shaders.blend's path under bundled_data/, raising
     ShaderTemplateError immediately if it's missing rather than letting
     bpy.data.libraries.load() fail later with a less informative error.
     """
@@ -107,7 +112,7 @@ def _template_blend_path():
 
 
 # ---------------------------------------------------------------------------
-# Shader-group detection -- also used by import_cha.py's
+# Shader-group detection -- also used by material_builder.py's
 # get_or_create_material() to distinguish an already-built material from
 # a same-named material that merely exists (e.g. a default-BSDF
 # placeholder import_gr2.py's low-level .gr2 reader creates for every
@@ -178,7 +183,7 @@ def _strip_dot_suffix(name):
 def _append_template_material(shader_type, scratch_name):
     # type: (str, str) -> bpy.types.Material
     """
-    Appends shader_type's template material from Atroxa_Shaders.blend
+    Appends shader_type's template material from HeroEngine_Shaders.blend
     under a throwaway name (scratch_name), deduping every one of its
     top-level shader-group nodes against whatever's already canonical in
     this file.
@@ -252,7 +257,7 @@ def _append_template_material(shader_type, scratch_name):
 def find_main_shader_group_node(material, shader_type):
     # type: (bpy.types.Material, str) -> bpy.types.Node
     """
-    Returns the material's own main shader group node -- e.g. the "Atroxa
+    Returns the material's own main shader group node -- e.g. the "HeroEngine
     SWTOR - Uber Shader" instance -- as opposed to any sibling detour
     group (DirectionMapUV, TransformAllUVs) that may also be present at
     the top level. Callers needing to set inputs like Alpha Blend/
@@ -290,7 +295,7 @@ def get_or_build_shader_material(shader_type, target_name, force=False):
     Returns a Material named target_name, built from shader_type's
     template if it doesn't already exist in the desired state.
 
-    Three cases when force=False (the default -- import_cha.py's
+    Three cases when force=False (the default -- material_builder.py's
     idempotent "build once" usage):
       1. A material named target_name already exists AND has one of our
          shader groups in it (has_swtor_shader_group()) -- already

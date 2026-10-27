@@ -6,7 +6,8 @@ Two-tier reader for SWTOR's .mat shader-definition files (XML).
 Tier 1 (read_mat_summary): cheap universal reader used by every .mat
 consumer -- the materials-by-name automatic (import_gr2.py 7a) and
 manual (ops/process_materials.py 7b) entry points, ops/import_cha.py's
-NPC importer (alpha only, see its get_or_create_material()), and
+NPC importer (alpha only, see ops/material_builder.py's
+get_or_create_material()), and
 eventually Area Assembler / generic-.gr2 import. Reads only <Derived>
 and <AlphaMode>/<AlphaTestValue>, plus the skip-list check. Never
 touches map/palette data.
@@ -14,7 +15,7 @@ touches map/palette data.
 Tier 2 (read_mat_full): full <input>-list adapter, producing a dict
 shaped identically to a Jedipedia json entry's materialInfo (matPath +
 ddsPaths + otherValues), so it can be handed straight to
-ops/import_cha.py's existing get_or_create_material() unchanged. Used by
+ops/material_builder.py's existing get_or_create_material() unchanged. Used by
 ops/process_materials.py (where there's no json to lean on at all, so
 this drives ddsPaths AND otherValues both) and by ops/import_cha.py's
 own use_mat_dds_paths option (where it only ever overrides specific
@@ -34,15 +35,23 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from .shared import resolve_existing_case
+
 
 # ---------------------------------------------------------------------------
 # Shader-type aliasing (handoff §3)
 # ---------------------------------------------------------------------------
 
-# Collapse onto DERIVED_CONFIGS' "Uber" entry (ops/import_cha.py).
+# Collapse onto DERIVED_CONFIGS' "Uber" entry (ops/material_builder.py).
+# "Grass" deliberately removed (was previously collapsed here too): real
+# grass/foliage .mat files never have a normal map (Diffuse + Gloss only)
+# and need their Diffuse alpha channel used for cutout masking, which the
+# generic Uber template doesn't do -- collapsing it onto Uber produced
+# solid-background, non-transparent "grass boxes" instead of real cards.
+# Now has its own DERIVED_CONFIGS["Grass"] entry and template instead.
 UBER_LIKE = {
-    "Uber", "UberHueable", "VegetationHighQuality", "Grass", "UberEnvBlend",
-    "Glass", "Ice", "UberScrolling", "Cloud", "Waterfall", "Vegetation",
+    "Uber", "UberHueable", "VegetationHighQuality", "UberEnvBlend",
+    "Glass", "Ice", "UberScrolling", "Cloud", "Waterfall",
 }
 # Collapse onto DERIVED_CONFIGS' "Creature" entry. Mirrors import_cha.py's
 # own existing "HighQualityCharacter" -> "Creature" handling.
@@ -52,7 +61,7 @@ CREATURE_LIKE = {"Creature", "HighQualityCharacter"}
 # keeps every caller's "derived" value uniformly "Garment").
 GARMENT_LIKE = {"Garment", "GarmentScrolling"}
 # Collapse variant Derived spellings onto DERIVED_CONFIGS' single
-# "AnimatedUV" key (ops/import_cha.py) -- no longer a "known but not yet
+# "AnimatedUV" key (ops/material_builder.py) -- no longer a "known but not yet
 # built" bucket now that a real template exists.
 ANIMATEDUV_LIKE = {
     "AnimatedUV", "AnimatedUVAlphaBlend", "AnimatedVFX", "AnimatedVFXAlphaBlend",
@@ -61,7 +70,12 @@ ANIMATEDUV_LIKE = {
 # Recognized but not yet built (handoff §3): materials of these collapsed
 # types should be skipped cleanly (not mishandled, not force-fit into
 # DERIVED_CONFIGS). Real support is additive later, not a rework.
-KNOWN_UNBUILT_DERIVED = {"EmissiveOnly"}
+# Currently empty: EmissiveOnly now has its own DERIVED_CONFIGS entry and
+# template, as do NoShadeTexFogged and Vegetation ("Vegetation" was
+# previously collapsed onto Uber via UBER_LIKE; "VegetationHighQuality"
+# deliberately still is). The bucket and its handling in
+# ops/process_materials.py are kept for the next recognized-but-unbuilt type.
+KNOWN_UNBUILT_DERIVED = set()
 
 _DERIVED_ALIASES = {}
 for _name in UBER_LIKE:
@@ -79,9 +93,11 @@ def collapse_derived(derived):
     # type: (str) -> str
     """
     Collapses a .mat file's raw <Derived> value onto the canonical
-    shader-family name used by ops/import_cha.py's DERIVED_CONFIGS
-    ("Uber"/"Creature"/"Garment"/"SkinB"/"Eye"/"HairC"/"AnimatedUV"), or
-    onto "EmissiveOnly" for the known-but-not-yet-built bucket (see
+    shader-family name used by ops/material_builder.py's DERIVED_CONFIGS
+    ("Uber"/"Creature"/"Garment"/"SkinB"/"Eye"/"HairC"/"AnimatedUV"). Names
+    that already match a DERIVED_CONFIGS key exactly ("Grass", "Vegetation",
+    "NoShadeTexFogged", "EmissiveOnly") pass through unchanged, as does
+    anything in the known-but-not-yet-built bucket (see
     KNOWN_UNBUILT_DERIVED). Anything else passes through unchanged
     -- DERIVED_CONFIGS.get() rejecting it is the caller's signal that
     it's a genuinely unsupported type, not this function's job to guess.
@@ -142,7 +158,7 @@ def resolve_mat_path(mat_name, primary_resources_dir, legacy_resources_dir=None)
     for root in (primary_resources_dir, legacy_resources_dir):
         if not root:
             continue
-        candidate = Path(root, *MATERIALS_SUBPATH, filename)
+        candidate = Path(resolve_existing_case(root, list(MATERIALS_SUBPATH) + [filename]))
         if candidate.is_file():
             return candidate, root
     return None, None
@@ -160,8 +176,8 @@ def resolve_mat_path(mat_name, primary_resources_dir, legacy_resources_dir=None)
 # Atroxa Shaders system computes alpha compositing entirely inside the
 # node group via these two booleans plus Alpha Test Value/Invert Alpha
 # -- material.surface_render_method stays "DITHERED" regardless (set
-# directly in ops/import_cha.py's get_or_create_material(), and baked
-# into every template material in bundled_data/Atroxa_Shaders.blend --
+# directly in ops/material_builder.py's get_or_create_material(), and baked
+# into every template material in bundled_data/HeroEngine_Shaders.blend --
 # see types/shader_templates.py), so no other Blender-level alpha
 # property needs to vary per AlphaMode.
 _ALPHA_TEST_MODES = {"Test"}
@@ -218,7 +234,7 @@ def read_mat_summary(mat_path, mat_name=None):
 # ---------------------------------------------------------------------------
 
 # Only semantics actually consumed by DERIVED_CONFIGS' "maps" tuples
-# (ops/import_cha.py) get captured into ddsPaths -- every OTHER texture
+# (ops/material_builder.py) get captured into ddsPaths -- every OTHER texture
 # semantic a .mat file's <input> list carries (EmissiveMap, OffsetMap,
 # animatedWrinkle*, Rim*, Reflection*, vegetationParams*, etc.) is
 # intentionally ignored: none of it is wired into any Atroxa Shaders
@@ -274,7 +290,7 @@ def read_mat_full(mat_path, mat_name=None):
     identically to a Jedipedia json entry's materialInfo -- "matPath"
     (resources-root-relative, same convention as the json's own),
     "ddsPaths", "otherValues" -- so it can be handed straight to
-    ops/import_cha.py's existing get_or_create_material() unchanged.
+    ops/material_builder.py's existing get_or_create_material() unchanged.
 
     Returns None on the same parse failures read_mat_summary() guards
     against. In practice this is only called after that already
@@ -311,8 +327,8 @@ def read_mat_full(mat_path, mat_name=None):
             if dds_key is not None:
                 # .mat texture values never carry the ".dds" extension
                 # (unlike a json's ddsPaths, which always do) -- add it
-                # here so downstream loading (import_cha.py's
-                # _load_or_get_image()/resolve_resource_path()) sees the
+                # here so downstream loading (material_builder.py's
+                # _load_or_get_image()/types/shared.py's resolve_resource_path()) sees the
                 # exact same shape either way.
                 normalized = value.replace("\\", "/").lstrip("/")
                 dds_paths[dds_key] = "/" + normalized + ".dds"

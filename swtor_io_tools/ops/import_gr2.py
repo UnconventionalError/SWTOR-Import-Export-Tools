@@ -21,7 +21,9 @@ class ImportJBA
 
 import json  # For dict-to-stringProperty translations 
 import os
+import re
 from math import pi as PI
+from pathlib import Path
 from tracemalloc import start
 from typing import Optional, Set
 import time
@@ -33,6 +35,7 @@ from bpy.types import Context, Operator, OperatorFileListElement
 # from bpy_extras.io_utils import ImportHelper
 from mathutils import Color, Matrix, Vector
 
+from .process_materials import apply_materials_by_name_after_import
 from ..types.gr2 import Granny2
 from ..utils.binary import ArrayBuffer, DataView
 from ..utils.number import decodeHalfFloat
@@ -561,6 +564,93 @@ def read(operator, filepath):
 
     return gr2
 
+# A LOD level in a mesh / object name: "LOD[2]", "..._LOD[0]", "lod_01", "lod0".
+# The "lod" must not be the tail of a longer word ("cold1", "plod2" don't count).
+_LOD_NAME_RE = re.compile(r"(?<![a-z])lod[\[_]?(\d+)")
+
+
+def lod_name_info(name):
+    # type: (str) -> tuple
+    """
+    (is_lod, is_lod0) for one mesh / object name. Recognises the original
+    "_lod" / "_lod0" substrings plus the naming real files actually use:
+    "LOD[2]", "bundle5_LOD[1]", "lod_01", "lod_0". Shared by build()'s
+    main-mesh pick below and by Area Assembler's LOD reducer
+    (ops/import_area.py), so both agree on what counts as a LOD.
+    """
+    name = name.lower()
+    is_lod = "_lod" in name
+    is_lod0 = "_lod0" in name
+    match = _LOD_NAME_RE.search(name)
+    if match:
+        is_lod = True
+        if int(match.group(1)) == 0:
+            is_lod0 = True
+    return is_lod, is_lod0
+
+
+# SpeedTree-style LOD suffix: "tyt_speedtree_main_pine_dying_l0", "..._l1", "..._l2".
+_LOD_SUFFIX_RE = re.compile(r"^(.*)_l(\d+)(?:\.\d+)?$")
+
+
+def sibling_lod_flags(names):
+    # type: (list) -> list
+    """
+    [(is_lod, is_lod0)] for each of one file's mesh names, for the "<base>_l<N>"
+    LOD naming that carries no "lod" in it at all. A "_l1" ending on its own
+    proves nothing (left panels, lamp 1...), so a name only counts when
+    SIBLINGS confirm it: at least two names in the same list share its base
+    and differ in the number ("pine_l0", "pine_l1", "pine_l2"). Blender's own
+    ".001" duplicate suffix is ignored.
+    """
+    groups = {}
+    for position, name in enumerate(names):
+        match = _LOD_SUFFIX_RE.match(name.lower())
+        if match:
+            groups.setdefault(match.group(1), []).append((position, int(match.group(2))))
+    flags = [(False, False)] * len(names)
+    for members in groups.values():
+        if len({level for _, level in members}) >= 2:
+            for position, level in members:
+                flags[position] = (True, level == 0)
+    return flags
+
+
+def main_mesh_index(names):
+    # type: (list) -> Optional[int]
+    """
+    Which of a .gr2's meshes (`names` = their art names, in file order, with
+    any skipped collision mesh already left out) is "the" model -- the one the
+    file's own name belongs to under Name As Filename.
+
+    The LOD0 mesh if the file has one (a multi-LOD file isn't necessarily
+    stored LOD0-first: ond_env_plant_bundle_001 is stored LOD[1], LOD[2],
+    LOD[0]); otherwise the first mesh, as the importer always assumed.
+    None for an empty list.
+    """
+    if not names:
+        return None
+    siblings = sibling_lod_flags(names)
+    for index, name in enumerate(names):
+        if lod_name_info(name)[1] or siblings[index][1]:
+            return index
+    return 0
+
+
+def main_mesh_key(mesh_buffer, import_collision):
+    # type: (dict, bool) -> Optional[int]
+    """
+    The key, in a .gr2's mesh_buffer, of the mesh that gets the file's name
+    under Name As Filename: main_mesh_index() over the meshes that will
+    actually become objects (a collision mesh is skipped unless
+    import_collision). None if there is none.
+    """
+    included_keys = [key for key, mesh in mesh_buffer.items()
+                     if not ("collision" in mesh.name and not import_collision)]
+    position = main_mesh_index([mesh_buffer[key].name for key in included_keys])
+    return included_keys[position] if position is not None else None
+
+
 def build(gr2,
           filepath="",
           import_collision        = None,
@@ -581,14 +671,17 @@ def build(gr2,
         bpy.data.materials.new(name=material).use_nodes = True
 
     # NOTE: Create Meshes
+    # Which mesh is the file's main one (named after the file, if asked to).
+    main_key = main_mesh_key(gr2.mesh_buffer, import_collision)
+
     for i, mesh in gr2.mesh_buffer.items():
 
-        # When using the name_as_filename option, we assume that, in the case of
-        # multiple mesh models/files (which get separated into multiple objects,
-        # as Blender doesn't support more than one mesh data block per object),
-        # the first mesh in the list is the main one. If not so, some heuristics
-        # could be added.
-        use_file_name_as_object_name = (i == 0 and name_as_filename is True)
+        # When using the name_as_filename option, in the case of multiple mesh
+        # models/files (which get separated into multiple objects, as Blender
+        # doesn't support more than one mesh data block per object) only the
+        # main mesh is named after the file: the LOD0 mesh if there is one,
+        # else the first one (see main_mesh_index()).
+        use_file_name_as_object_name = (i == main_key and name_as_filename is True)
 
 
         if "collision" in mesh.name and not import_collision:
@@ -1009,7 +1102,11 @@ def load(operator, context, filepath = ""):
             objects_names = build(mesh,
                                   filepath              = filepath,
                                   import_collision      = False,
-                                  name_as_filename      = False,
+                                  # Neutral settings mean "as older tools expect", which
+                                  # includes art names -- except when the calling tool
+                                  # explicitly asks otherwise (Area Assembler's
+                                  # "Name Objects As Filenames"); nothing else sets this.
+                                  name_as_filename      = bool(getattr(operator, "area_name_as_filename", False)),
                                   scale_object          = False,
                                   scale_factor          = 1.0,
                                   apply_axis_conversion = False,
@@ -1066,7 +1163,6 @@ def load(operator, context, filepath = ""):
                 apply_materials_by_name = prefs.gr2_apply_materials_by_name_default
 
             if apply_materials_by_name and objects_names:
-                from .process_materials import apply_materials_by_name_after_import
                 apply_materials_by_name_after_import(objects_names)
 
         
@@ -1095,3 +1191,266 @@ def load(operator, context, filepath = ""):
         return True
     else:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers for importing .gr2 files programmatically with mesh reuse
+# ---------------------------------------------------------------------------
+#
+# Moved here from ops/import_area.py so that every importer that needs a
+# cached/merged .gr2 import (Area Assembler, .fxspec import, the HMS DYD
+# scatter) depends on THIS module rather than on each other -- ops/dyd_scatter.py
+# used to import them from ops/import_area.py, which made it impossible for
+# import_area.py to import anything built on dyd_scatter.py without a cycle.
+# Behaviour is unchanged.
+
+
+class _MeshCache:
+    """
+    Caches already-imported .gr2 mesh data by resolved (absolute,
+    on-disk) path, so a source file reused many times across one area
+    (a candle, a crate, a piece of trim) only gets parsed/built once.
+    Later instances get a cheap bpy.data.objects.new() sharing that
+    mesh data instead of a full reimport.
+
+    A stored entry is either a non-empty list of (Mesh, gr2_material_names)
+    pairs (a multi-mesh .gr2 produces more than one Object on its first
+    import; every later instance reproduces that same multi-object
+    shape) or None, meaning the first import of this path produced
+    nothing usable -- remembered so later instances don't retry it.
+
+    gr2_material_names is captured alongside its mesh specifically
+    because it's an Object-level custom property, not a Mesh-level one
+    -- bpy.data.objects.new() does NOT copy custom properties from
+    wherever a mesh came from, even when reusing that exact mesh
+    data-block, so a fresh copy has to be set explicitly on every new
+    instance or it silently ends up missing. CONFIRMED real bug this
+    fixes: _filter_excluded_objects()'s utility-material check reads
+    this property per-object, so every cache-instantiated repeat of a
+    to-be-excluded object (e.g. a reused occluder mesh) was silently
+    skipping that check and never getting excluded -- only a path's
+    very first, freshly-imported instance ever actually had the
+    property to check against.
+
+    scale_factor is baked into each freshly-cached mesh's vertex data
+    exactly once, here, not reflected in Object.scale -- matching this
+    addon's own .gr2 importer convention (confirmed against
+    import_gr2.py's build(): scale_object bakes into geometry via
+    transform_apply, Object.scale is reset to its natural value
+    afterward). Every later instance sharing this cached mesh data
+    automatically gets the correctly pre-scaled geometry for free.
+    """
+    def __init__(self, scale_factor=1.0):
+        self._cache = {}  # resolved_path -> list[(Mesh, material_names_json_or_None)] or None
+        self._main_index = {}  # resolved_path -> which entry is named after the file (default: the first)
+        self._scale_factor = scale_factor
+
+    def has(self, resolved_path):
+        return resolved_path in self._cache
+
+    def store(self, resolved_path, objects, main_index=None):
+        # type: (str, list, Optional[int]) -> None
+        """main_index: which of the stored meshes instantiate() should name
+        after the file (None = the first, the long-standing behaviour). It
+        indexes the meshes in `objects` order, objects without mesh data left
+        out -- the same list the entries are built from."""
+        if self._scale_factor != 1.0:
+            scale_matrix = Matrix.Scale(self._scale_factor, 4)
+            seen_meshes = set()
+            for ob in objects:
+                if ob.data is not None and id(ob.data) not in seen_meshes:
+                    ob.data.transform(scale_matrix)
+                    ob.data.update()
+                    seen_meshes.add(id(ob.data))
+        entries = [(ob.data, ob.get("gr2_material_names")) for ob in objects if ob.data is not None]
+        # Give every cached mesh a fake user. Area Assembler deletes some of an
+        # import's objects right after it (Skip Game Engine Objects, the
+        # SpeedTree LOD reducer), which leaves their meshes with no users --
+        # and ANY global bpy.data.orphans_purge() later in the batch (the
+        # terrain material builder runs one while de-duplicating shared node
+        # groups) would free them out from under this cache, so the next
+        # instantiate() of that path fails with "StructRNA of type Mesh has
+        # been removed" and every later instance of the file goes missing.
+        # release() drops the protection at the end of the batch.
+        for mesh_data, _material_names in entries:
+            mesh_data.use_fake_user = True
+        self._cache[resolved_path] = entries or None
+        if main_index is not None:
+            self._main_index[resolved_path] = main_index
+
+    def release(self):
+        """Drops the fake users store() added. Call once the batch is done
+        (every instantiate() has happened); idempotent, and tolerant of a
+        mesh that has already been removed."""
+        for entries in self._cache.values():
+            for mesh_data, _material_names in entries or ():
+                try:
+                    mesh_data.use_fake_user = False
+                except ReferenceError:
+                    pass
+
+    def instantiate(self, resolved_path, name):
+        # type: (str, str) -> list
+        """
+        Builds new Object(s) sharing this path's cached mesh data.
+        Returns [] for a known-discard path.
+
+        Deliberately does NOT parent multi-mesh sub-objects to each
+        other -- matches observed behavior of a fresh multi-mesh .gr2
+        import (confirmed against a real 220-file batch import with no
+        multi-mesh positioning issues, meaning build() itself doesn't
+        parent its own sub-objects together either). Keeping every
+        object here fully independent means _process_element's own
+        "if ob.parent is None: _apply_transform(...)" applies uniformly
+        to all of them, and removes any risk from later deleting one
+        sub-object (e.g. a DBO/utility-material exclusion) leaving
+        others orphaned mid-scene with only their original, un-baked
+        local transform.
+        """
+        entries = self._cache.get(resolved_path)
+        if not entries:
+            return []
+        objects = []
+        main_index = self._main_index.get(resolved_path, 0)
+        for i, (mesh_data, material_names) in enumerate(entries):
+            ob_name = name if i == main_index else mesh_data.name
+            new_ob = bpy.data.objects.new(ob_name, mesh_data)
+            if material_names is not None:
+                new_ob["gr2_material_names"] = material_names
+            objects.append(new_ob)
+        return objects
+
+
+def _job_results_key(filepath):
+    # type: (str) -> str
+    """Normalizes a filepath into the key load() above uses for job_results['files_objs_names']."""
+    normalized = filepath.replace("\\", "/")
+    if "resources" in normalized:
+        return normalized.partition("resources/")[2]
+    return normalized
+
+
+def _merge_multi_mesh_objects(objects, name):
+    # type: (list, str) -> list
+    """
+    Joins multiple Objects into one via bpy.ops.object.join(), matching
+    the old source's "Merge Multi-Mesh Objects" option (confirmed real
+    toggle there too, default off -- same default kept here).
+
+    Always renames both the resulting Object AND its mesh data-block to
+    `name` (the resolved .gr2's own filename stem) -- CONFIRMED bug this
+    fixes: an earlier version only renamed the Object, leaving the mesh
+    DATA-block (a separate ID datablock bpy.ops.object.join() doesn't
+    touch the name of) still carrying whichever sub-object happened to
+    be arbitrarily active before the join, e.g. "Object17" instead of
+    the real name.
+
+    Also rebuilds "gr2_material_names" for the merged result --
+    CONFIRMED bug this fixes, and the more serious one: that property
+    lives on the OBJECT, not the mesh data, and bpy.ops.object.join()
+    only keeps the ACTIVE object's own custom properties -- every OTHER
+    sub-object's own gr2_material_names is simply lost when that object
+    gets deleted by the join. Left unfixed, only whichever few material
+    slots happened to belong to the arbitrarily-active sub-object ever
+    got real names; every other slot silently kept whatever generic
+    Blender default it already had, with nothing left to tell
+    apply_materials_by_name_to_gr2_objects() what those slots were
+    really supposed to be. Fixed by capturing each sub-object's own
+    slot-name mapping BEFORE the join (keyed by the actual material
+    ID-datablock, not by slot index -- robust regardless of how
+    bpy.ops.object.join() itself reorders or deduplicates identically-
+    named slots internally, which isn't something worth relying on),
+    then rebuilding the merged object's own gr2_material_names by
+    walking its FINAL slot list and looking up each slot's real name
+    through that mapping. A slot whose original name can't be recovered
+    (came from an object with no gr2_material_names at all, or slot
+    genuinely has no material) falls back to that slot's own current
+    Blender material name -- matches this same file's own existing 7b
+    precedent for the same situation, and is always a safe string
+    (never None, which would crash the string/path operations inside
+    _build_named_material's own .mat file lookup).
+
+    No parenting anywhere in this path -- confirmed not needed here,
+    per this addon's own earlier decision (see _MeshCache.instantiate()'s
+    own note on why fresh multi-mesh .gr2 imports don't need it either).
+    """
+    if len(objects) <= 1:
+        return objects
+
+    material_name_by_datablock = {}
+    for ob in objects:
+        raw = ob.get("gr2_material_names")
+        if not raw:
+            continue
+        try:
+            original_names = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        for slot, real_name in zip(ob.data.materials, original_names):
+            if slot is not None and isinstance(real_name, str) and real_name:
+                material_name_by_datablock[slot] = real_name
+
+    bpy.ops.object.select_all(action='DESELECT')
+    for ob in objects:
+        ob.select_set(True)
+    bpy.context.view_layer.objects.active = objects[0]
+    bpy.ops.object.join()
+
+    merged = bpy.context.view_layer.objects.active
+    merged.name = name
+    merged.data.name = name
+
+    merged_names = [
+        material_name_by_datablock.get(slot, slot.name if slot is not None else "")
+        for slot in merged.data.materials
+    ]
+    if merged_names:
+        merged["gr2_material_names"] = json.dumps(merged_names)
+
+    return [merged]
+
+
+def _import_gr2(operator, context, resources_root, resolved_path, mesh_cache):
+    # type: (Any, Any, str, str, _MeshCache) -> list
+    """
+    Returns a list of Objects for `resolved_path` (an absolute, on-disk
+    .gr2 path), either freshly imported or instantiated from mesh_cache.
+
+    Naming: no name is passed in for a fresh import -- build() names the
+    resulting objects. Under this operator's neutral settings that means
+    each model's own art name ("LOD[0]", "trunk002", ...), unless the
+    operator's area_name_as_filename is on, in which case the file's MAIN
+    mesh is named after the file (see main_mesh_index()). (An earlier
+    version of this function threaded the calling element's raw numeric
+    SWTOR id through as the name, which only got used on the
+    *cached-instance* path below, producing objects named like
+    "4611686170648420455" on the second+ instance of a reused mesh.)
+    The cached-instance path names one stored mesh after the resolved
+    path's own filename: the first one by default, or -- when
+    area_name_as_filename is on -- the same main mesh a fresh import
+    named, so every copy of a file ends up named alike.
+
+    Merging (area_merge_multi_mesh_objects) happens here, once, on a
+    FRESH import only, before mesh_cache.store() -- so the cached mesh
+    data is already the single merged result, and every later reused
+    instance automatically gets the merged shape for free too, same
+    reasoning as scale_factor baking happening at this exact point.
+    """
+    if mesh_cache.has(resolved_path):
+        return mesh_cache.instantiate(resolved_path, Path(resolved_path).stem)
+
+    operator.job_results_rich = True
+    load(operator, context, resolved_path)
+
+    object_names = job_results.get("files_objs_names", {}).get(_job_results_key(resolved_path), [])
+    imported_objects = [bpy.data.objects[n] for n in object_names]
+    if operator.area_merge_multi_mesh_objects and len(imported_objects) > 1:
+        imported_objects = _merge_multi_mesh_objects(imported_objects, Path(resolved_path).stem)
+    main_index = None
+    if getattr(operator, "area_name_as_filename", False):
+        # Name Objects As Filenames: load() named the file's MAIN mesh after the
+        # file, so reused instances must name that same one (not just whichever
+        # sub-object happens to be stored first).
+        main_index = main_mesh_index([ob.data.name for ob in imported_objects if ob.data is not None])
+    mesh_cache.store(resolved_path, imported_objects, main_index)
+    return imported_objects

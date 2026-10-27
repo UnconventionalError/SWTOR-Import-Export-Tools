@@ -1,10 +1,10 @@
 # ============================================================================
-# MIGRATION BRIDGE -- ShaderNodeHeroEngine (deprecated) -> Atroxa Shader
+# MIGRATION BRIDGE -- ShaderNodeHeroEngine (deprecated) -> HeroEngine Shader
 # native node groups (current)
 #
 # Converts a material's old custom-Python-node SWTOR shader
 # (ShaderNodeHeroEngine, types/node_deprecated.py) to the equivalent
-# native ShaderNodeGroup-based "Atroxa Shader" (built by
+# native ShaderNodeGroup-based "HeroEngine Shader" (built by
 # ops/shaders_menu.py's build_swtor_shader_material()), in place -- same
 # material name/identity, node graph swapped internally.
 #
@@ -15,12 +15,12 @@
 # __init__.py's "DEPRECATED SYSTEM" block, which this file has been
 # added to.
 #
-# Deliberately self-contained: does NOT import from ops/import_cha.py.
-# import_cha.py is active, in-use code with no relationship to the
-# deprecated system -- keeping this file free of any dependency on it
+# Deliberately self-contained: does NOT import from ops/material_builder.py
+# or types/shared.py. Those are active, in-use code with no relationship to
+# the deprecated system -- keeping this file free of any dependency on them
 # means it can be deleted the day the deprecated system goes, without
 # having to check whether doing so breaks anything else, or touch
-# import_cha.py at all. Per Crunch, this holds even where the two files'
+# them at all. Per Crunch, this holds even where the two files'
 # solutions are shaped alike (default map assets, palette writing) --
 # duplication is the accepted cost of that isolation.
 #
@@ -47,7 +47,7 @@ from ..types.shader_templates import find_main_shader_group_node, get_or_build_s
 # Default map assets -- loaded in place of an optional map that's absent
 # on the old node, so the new group doesn't end up with a live-but-empty
 # Image Texture node overriding its own (correct, no-op) socket default
-# with black. Mirrors import_cha.py's DEFAULT_MAP_ASSETS of the same
+# with black. Mirrors material_builder.py's DEFAULT_MAP_ASSETS of the same
 # name, deliberately duplicated rather than imported -- see module
 # docstring. Paths relative to the resources root, same convention as
 # every other dds path in this addon.
@@ -75,7 +75,7 @@ DEFAULT_MAP_ASSETS = {
 def _resolve_resource_path(resources_root, relative_path):
     # type: (str, Optional[str]) -> Optional[str]
     """
-    Local copy of import_cha.py's resolve_resource_path() -- deliberately
+    Local copy of types/shared.py's resolve_resource_path() -- deliberately
     duplicated rather than imported, see module docstring.
 
     Resolves a relative asset path against a local resources root folder
@@ -99,12 +99,12 @@ def _resolve_resource_path(resources_root, relative_path):
 
 def _load_or_get_image(resources_root, relative_path):
     """
-    Local copy of import_cha.py's _load_or_get_image() -- deliberately
+    Local copy of material_builder.py's _load_or_get_image() -- deliberately
     duplicated rather than imported, see module docstring.
 
     Loads a .dds texture from the resources root, reusing an already-
     loaded Blender image with the same filename if one exists. Sets
-    alpha_mode/colorspace exactly as import_cha.py's copy does, so a
+    alpha_mode/colorspace exactly as material_builder.py's copy does, so a
     default asset loaded via migration looks identical to the same asset
     loaded via import.
 
@@ -301,8 +301,8 @@ def migrate_material(material):
     # type: (bpy.types.Material) -> MigrationResult
     """
     Converts one material's ShaderNodeHeroEngine node (if present) to the
-    equivalent native Atroxa Shader, replacing the whole material via
-    the same append-from-template mechanism import_cha.py and the
+    equivalent native HeroEngine Shader, replacing the whole material via
+    the same append-from-template mechanism material_builder.py and the
     interactive Add-menu use (types/shader_templates.py) -- every
     existing user of the old material redirected onto the new one, old
     material (old_node and its private node_tree included) deleted, new
@@ -363,7 +363,7 @@ def migrate_material(material):
 
     # alpha_mode/alpha_test_value/alpha_invert are the real, correct
     # values for this specific material -- read and preserve them
-    # faithfully, don't default them (unlike import_cha.py's json-driven
+    # faithfully, don't default them (unlike material_builder.py's json-driven
     # import, which always forces CLIP -- not applicable here).
     alpha_blend = (old_node.alpha_mode == 'BLEND')
     alpha_test = (old_node.alpha_mode == 'CLIP')
@@ -500,7 +500,7 @@ def _migrate_and_report(operator, materials):
 
 
 class SWTOR_OT_migrate_shader(bpy.types.Operator):
-    """Converts this material's deprecated SWTOR shader node to the native Atroxa Shader node group, in place"""
+    """Converts this material's deprecated SWTOR shader node to the native HeroEngine Shader node group, in place"""
     bl_idname = 'swtor.migrate_shader'
     bl_label = 'Migrate Atroxa Shader (Current Material)'
     bl_options = {'REGISTER', 'UNDO'}
@@ -524,12 +524,12 @@ class SWTOR_OT_migrate_shader(bpy.types.Operator):
                 f"Migrated '{original_name}', but couldn't find default assets for: {', '.join(result.missing_assets)}",
             )
         else:
-            self.report({'INFO'}, f"Migrated '{original_name}' to the native Atroxa Shader")
+            self.report({'INFO'}, f"Migrated '{original_name}' to the native HeroEngine Shader")
         return {'FINISHED'}
 
 
 class SWTOR_OT_migrate_shaders_selected(bpy.types.Operator):
-    """Converts every deprecated SWTOR shader node found on materials across all selected objects to native Atroxa Shader node groups, in place"""
+    """Converts every deprecated SWTOR shader node found on materials across all selected objects to native HeroEngine Shader node groups, in place"""
     bl_idname = 'swtor.migrate_shaders_selected'
     bl_label = 'Migrate Atroxa Shaders (Selected Objects)'
     bl_options = {'REGISTER', 'UNDO'}
@@ -579,7 +579,7 @@ def swtor_migrate_submenu_element(self, context):
 
 
 class SWTOR_OT_migrate_shaders_file(bpy.types.Operator):
-    """Converts every deprecated SWTOR shader node found on any material in this .blend to native Atroxa Shader node groups, in place"""
+    """Converts every deprecated SWTOR shader node found on any material in this .blend to native HeroEngine Shader node groups, in place"""
     bl_idname = 'swtor.migrate_shaders_file'
     bl_label = 'Migrate Atroxa Shaders (Whole File)'
     bl_options = {'REGISTER', 'UNDO'}

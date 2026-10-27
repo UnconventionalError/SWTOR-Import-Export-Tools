@@ -31,19 +31,26 @@ from pathlib import Path
 import bpy
 from mathutils import Matrix
 
-from .import_gr2 import load as ImportGR2_load
-from .import_cha import resolve_resource_path
+from .import_gr2 import _MeshCache, _import_gr2, lod_name_info, sibling_lod_flags
+from .import_hms import DEFAULT_MAX_VIEWPORT_INSTANCES, HmsBatch, process_terrain_element
 from .process_materials import apply_materials_by_name_to_gr2_objects, _summarize_and_report
 from ..types import area as area_types
-from ..types.shared import job_results
+from ..types.shared import job_results, resolve_resource_path
 
-# NOTE: ops/import_fxspec.py is deliberately NOT imported at module
-# level here -- it imports _MeshCache/_job_results_key FROM this module,
-# so a top-level import here would create an import cycle
-# (import_area -> import_fxspec -> import_area). Same deferred-import
-# pattern already used between ops/import_gr2.py and
-# ops/process_materials.py -- see _process_fxspec_element's own
-# function-local import instead.
+# NOTE: ops/import_fxspec.py is still imported lazily here (see
+# _process_fxspec_element's own function-local import), a leftover from
+# when it imported _MeshCache/_job_results_key FROM this module and a
+# top-level import would have been an import cycle. Those helpers now
+# live in ops/import_gr2.py (along with _import_gr2 and
+# _merge_multi_mesh_objects), so that cycle no longer exists -- the
+# deferred import was deliberately left as-is rather than changed in the
+# same step as the move. Same deferred-import pattern is still in use
+# between ops/import_gr2.py and ops/process_materials.py.
+#
+# NOTE: ops/import_room_lights.py is likewise deliberately NOT imported
+# at module level here, same reasoning -- it imports _apply_transform/
+# _build_placeholder_light FROM this module. See ImportAREA.execute()'s
+# and _process_area_element()'s own function-local imports instead.
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +69,7 @@ IN_SCOPE_EXTENSIONS = {"gr2", "mag", "spt", "spn_p", "hms", "lit", "fxp"}
 # objects for via the generic .gr2/.mag/.spt import path. ".lit" and
 # ".hms" are handled separately -- ".lit" in _process_element's own
 # early branch (see _LightCache), ".hms" in _process_area_element's own
-# early branch (see _process_terrain_element) -- neither goes through
+# early branch (see ops/import_hms.py) -- neither goes through
 # the .gr2 importer at all, but both still count as "buildable" in
 # spirit, just not through this specific path. The remainder (.fxp) is
 # a real, in-scope format without an importer yet -- skipped with an
@@ -228,102 +235,18 @@ def _resolve_import_target(relative_path):
 # idea, cleanly, not as the old flat dict" decision)
 # ---------------------------------------------------------------------------
 
-class _MeshCache:
-    """
-    Caches already-imported .gr2 mesh data by resolved (absolute,
-    on-disk) path, so a source file reused many times across one area
-    (a candle, a crate, a piece of trim) only gets parsed/built once.
-    Later instances get a cheap bpy.data.objects.new() sharing that
-    mesh data instead of a full reimport.
-
-    A stored entry is either a non-empty list of (Mesh, gr2_material_names)
-    pairs (a multi-mesh .gr2 produces more than one Object on its first
-    import; every later instance reproduces that same multi-object
-    shape) or None, meaning the first import of this path produced
-    nothing usable -- remembered so later instances don't retry it.
-
-    gr2_material_names is captured alongside its mesh specifically
-    because it's an Object-level custom property, not a Mesh-level one
-    -- bpy.data.objects.new() does NOT copy custom properties from
-    wherever a mesh came from, even when reusing that exact mesh
-    data-block, so a fresh copy has to be set explicitly on every new
-    instance or it silently ends up missing. CONFIRMED real bug this
-    fixes: _filter_excluded_objects()'s utility-material check reads
-    this property per-object, so every cache-instantiated repeat of a
-    to-be-excluded object (e.g. a reused occluder mesh) was silently
-    skipping that check and never getting excluded -- only a path's
-    very first, freshly-imported instance ever actually had the
-    property to check against.
-
-    scale_factor is baked into each freshly-cached mesh's vertex data
-    exactly once, here, not reflected in Object.scale -- matching this
-    addon's own .gr2 importer convention (confirmed against
-    import_gr2.py's build(): scale_object bakes into geometry via
-    transform_apply, Object.scale is reset to its natural value
-    afterward). Every later instance sharing this cached mesh data
-    automatically gets the correctly pre-scaled geometry for free.
-    """
-    def __init__(self, scale_factor=1.0):
-        self._cache = {}  # resolved_path -> list[(Mesh, material_names_json_or_None)] or None
-        self._scale_factor = scale_factor
-
-    def has(self, resolved_path):
-        return resolved_path in self._cache
-
-    def store(self, resolved_path, objects):
-        # type: (str, list) -> None
-        if self._scale_factor != 1.0:
-            scale_matrix = Matrix.Scale(self._scale_factor, 4)
-            seen_meshes = set()
-            for ob in objects:
-                if ob.data is not None and id(ob.data) not in seen_meshes:
-                    ob.data.transform(scale_matrix)
-                    ob.data.update()
-                    seen_meshes.add(id(ob.data))
-        entries = [(ob.data, ob.get("gr2_material_names")) for ob in objects if ob.data is not None]
-        self._cache[resolved_path] = entries or None
-
-    def instantiate(self, resolved_path, name):
-        # type: (str, str) -> list
-        """
-        Builds new Object(s) sharing this path's cached mesh data.
-        Returns [] for a known-discard path.
-
-        Deliberately does NOT parent multi-mesh sub-objects to each
-        other -- matches observed behavior of a fresh multi-mesh .gr2
-        import (confirmed against a real 220-file batch import with no
-        multi-mesh positioning issues, meaning build() itself doesn't
-        parent its own sub-objects together either). Keeping every
-        object here fully independent means _process_element's own
-        "if ob.parent is None: _apply_transform(...)" applies uniformly
-        to all of them, and removes any risk from later deleting one
-        sub-object (e.g. a DBO/utility-material exclusion) leaving
-        others orphaned mid-scene with only their original, un-baked
-        local transform.
-        """
-        entries = self._cache.get(resolved_path)
-        if not entries:
-            return []
-        objects = []
-        for i, (mesh_data, material_names) in enumerate(entries):
-            ob_name = name if i == 0 else mesh_data.name
-            new_ob = bpy.data.objects.new(ob_name, mesh_data)
-            if material_names is not None:
-                new_ob["gr2_material_names"] = material_names
-            objects.append(new_ob)
-        return objects
-
-
 # ---------------------------------------------------------------------------
 # Lights (handoff's "Create Scene Lights" priority)
 # ---------------------------------------------------------------------------
 
-# Confirmed against the old source: .lit file contents are never
-# actually read/parsed anywhere -- a .lit-tagged element just marks
-# "put a generic placeholder light here". Keeping that same simplicity
-# deliberately (Crunch's own call, given real per-light color/intensity
-# data isn't available yet, and richer export data enabling real light
-# types is planned as separate future work this shouldn't fight with).
+# Generic placeholder used when a ".lit" element carries no real
+# per-light data at all (a ".lit" reached via ".spn_p" -> ".dyn"
+# expansion, which never carries light data -- see
+# ops/import_room_lights.py's module docstring for why), OR as the
+# soft-fail fallback if building a REAL light from a direct ".lit"
+# element's own data fails for any reason (see _build_placeholder_light
+# below, and ops/import_room_lights.py's _process_light_element, which
+# is where that fallback actually gets used).
 DEFAULT_LIGHT_ENERGY = 2.0
 
 # Per-file safeguard against tanking viewport performance with hundreds
@@ -375,6 +298,20 @@ class _LightCache:
         handles the rest, same as any other repeated name in this addon.
         """
         return "light - %s" % self._area_name
+
+
+def _build_placeholder_light(light_cache, transform):
+    # type: (_LightCache, area_types.ResolvedTransform) -> Any
+    """
+    Builds one generic placeholder light Object from `light_cache`,
+    placed via the usual _apply_transform(). Extracted out of
+    _process_element()'s own ".lit" branch so ops/import_room_lights.py
+    can reuse the exact same fallback for a direct ".lit" element whose
+    real-light build failed -- see that module's _process_light_element.
+    """
+    light_ob = bpy.data.objects.new(light_cache.object_name(), light_cache.get())
+    _apply_transform(light_ob, transform)
+    return light_ob
 
 
 def _find_layer_collection(layer_collection, target_collection):
@@ -472,130 +409,30 @@ class _LightBudget:
             )
 
 
-def _job_results_key(filepath):
-    # type: (str) -> str
-    """Mirrors import_gr2.py's own key normalization for job_results['files_objs_names']."""
-    normalized = filepath.replace("\\", "/")
-    if "resources" in normalized:
-        return normalized.partition("resources/")[2]
-    return normalized
-
-
-def _merge_multi_mesh_objects(objects, name):
-    # type: (list, str) -> list
+def _lod_state(ob):
+    # type: (Any) -> tuple
     """
-    Joins multiple Objects into one via bpy.ops.object.join(), matching
-    the old source's "Merge Multi-Mesh Objects" option (confirmed real
-    toggle there too, default off -- same default kept here).
-
-    Always renames both the resulting Object AND its mesh data-block to
-    `name` (the resolved .gr2's own filename stem) -- CONFIRMED bug this
-    fixes: an earlier version only renamed the Object, leaving the mesh
-    DATA-block (a separate ID datablock bpy.ops.object.join() doesn't
-    touch the name of) still carrying whichever sub-object happened to
-    be arbitrarily active before the join, e.g. "Object17" instead of
-    the real name.
-
-    Also rebuilds "gr2_material_names" for the merged result --
-    CONFIRMED bug this fixes, and the more serious one: that property
-    lives on the OBJECT, not the mesh data, and bpy.ops.object.join()
-    only keeps the ACTIVE object's own custom properties -- every OTHER
-    sub-object's own gr2_material_names is simply lost when that object
-    gets deleted by the join. Left unfixed, only whichever few material
-    slots happened to belong to the arbitrarily-active sub-object ever
-    got real names; every other slot silently kept whatever generic
-    Blender default it already had, with nothing left to tell
-    apply_materials_by_name_to_gr2_objects() what those slots were
-    really supposed to be. Fixed by capturing each sub-object's own
-    slot-name mapping BEFORE the join (keyed by the actual material
-    ID-datablock, not by slot index -- robust regardless of how
-    bpy.ops.object.join() itself reorders or deduplicates identically-
-    named slots internally, which isn't something worth relying on),
-    then rebuilding the merged object's own gr2_material_names by
-    walking its FINAL slot list and looking up each slot's real name
-    through that mapping. A slot whose original name can't be recovered
-    (came from an object with no gr2_material_names at all, or slot
-    genuinely has no material) falls back to that slot's own current
-    Blender material name -- matches this same file's own existing 7b
-    precedent for the same situation, and is always a safe string
-    (never None, which would crash the string/path operations inside
-    _build_named_material's own .mat file lookup).
-
-    No parenting anywhere in this path -- confirmed not needed here,
-    per this addon's own earlier decision (see _MeshCache.instantiate()'s
-    own note on why fresh multi-mesh .gr2 imports don't need it either).
+    (is_lod, is_lod0) for an imported sub-object, judged by its OBJECT name and
+    its MESH name. Both, because _MeshCache.instantiate() renames one
+    sub-object of a multi-mesh file to the plain file stem for every reused
+    instance (and Name Objects As Filenames does the same to the main mesh on
+    a fresh import), so that object's own name no longer says it is a LOD; the
+    mesh data keeps its original art name. What counts as a LOD name is
+    import_gr2.lod_name_info().
     """
-    if len(objects) <= 1:
-        return objects
-
-    material_name_by_datablock = {}
-    for ob in objects:
-        raw = ob.get("gr2_material_names")
-        if not raw:
-            continue
-        try:
-            original_names = json.loads(raw)
-        except (ValueError, TypeError):
-            continue
-        for slot, real_name in zip(ob.data.materials, original_names):
-            if slot is not None and isinstance(real_name, str) and real_name:
-                material_name_by_datablock[slot] = real_name
-
-    bpy.ops.object.select_all(action='DESELECT')
-    for ob in objects:
-        ob.select_set(True)
-    bpy.context.view_layer.objects.active = objects[0]
-    bpy.ops.object.join()
-
-    merged = bpy.context.view_layer.objects.active
-    merged.name = name
-    merged.data.name = name
-
-    merged_names = [
-        material_name_by_datablock.get(slot, slot.name if slot is not None else "")
-        for slot in merged.data.materials
-    ]
-    if merged_names:
-        merged["gr2_material_names"] = json.dumps(merged_names)
-
-    return [merged]
+    names = [ob.name]
+    if ob.data is not None:
+        names.append(ob.data.name)
+    is_lod = False
+    is_lod0 = False
+    for name in names:
+        name_is_lod, name_is_lod0 = lod_name_info(name)
+        is_lod = is_lod or name_is_lod
+        is_lod0 = is_lod0 or name_is_lod0
+    return is_lod, is_lod0
 
 
-def _import_gr2(operator, context, resources_root, resolved_path, mesh_cache):
-    # type: (Any, Any, str, str, _MeshCache) -> list
-    """
-    Returns a list of Objects for `resolved_path` (an absolute, on-disk
-    .gr2 path), either freshly imported or instantiated from mesh_cache.
-
-    Naming: a fresh import doesn't need a name passed in here at all --
-    build() already names the resulting object(s) from the .gr2
-    filename itself, exactly matching a normal standalone .gr2 import
-    (confirmed fix -- an earlier version of this function threaded the
-    calling element's raw numeric SWTOR id through as the name, which
-    only actually got used on the *cached-instance* path below,
-    producing objects named like "4611686170648420455" instead of
-    their real .gr2-derived name on the second+ instance of a reused
-    mesh). The cached-instance path derives its name from the resolved
-    path's own filename for exactly the same reason.
-
-    Merging (area_merge_multi_mesh_objects) happens here, once, on a
-    FRESH import only, before mesh_cache.store() -- so the cached mesh
-    data is already the single merged result, and every later reused
-    instance automatically gets the merged shape for free too, same
-    reasoning as scale_factor baking happening at this exact point.
-    """
-    if mesh_cache.has(resolved_path):
-        return mesh_cache.instantiate(resolved_path, Path(resolved_path).stem)
-
-    operator.job_results_rich = True
-    ImportGR2_load(operator, context, resolved_path)
-
-    object_names = job_results.get("files_objs_names", {}).get(_job_results_key(resolved_path), [])
-    imported_objects = [bpy.data.objects[n] for n in object_names]
-    if operator.area_merge_multi_mesh_objects and len(imported_objects) > 1:
-        imported_objects = _merge_multi_mesh_objects(imported_objects, Path(resolved_path).stem)
-    mesh_cache.store(resolved_path, imported_objects)
-    return imported_objects
+_lod_notes_seen = set()
 
 
 def _reduce_speedtree_lods(objects, is_speedtree, element_name):
@@ -603,29 +440,69 @@ def _reduce_speedtree_lods(objects, is_speedtree, element_name):
     """
     Carried forward from the old source: a SpeedTree (or tree-named)
     multi-mesh import commonly produces several LOD (level-of-detail)
-    objects; keep only the highest-polygon one, unless an object's name
-    contains "_lod0" (kept regardless -- treated as the canonical mesh
-    alongside the highest-poly pick, matching the old source exactly).
+    objects, of which only one should end up in the scene.
 
-    This is real, previously-working logic being carried forward, not
-    something invented for this pass -- flagged in the handoff writeup
-    as worth a deliberate confirm given it's a specific name-substring
-    heuristic.
+    Extended (confirmed against real files): the same reduction applies to ANY
+    multi-mesh import whose sub-objects are named as LODs -- plant bundles
+    ("LOD[0]", "LOD[1]", "LOD[2]") aren't tree-named but are the same thing --
+    and the SpeedTree files' "<name>_l0/_l1/_l2" naming is recognised too
+    (when siblings confirm it).
+
+    Which LOD survives: the LOD0-named one if there is one, otherwise the
+    highest-polygon one. (The old rule always kept the highest-polygon one
+    and merely tolerated a "_lod0" name alongside it; but a file whose LOD[1]
+    has as many polygons as its LOD[0] -- or more -- then kept both, and
+    stored-LOD[1]-first order made a tie pick LOD[1].) Parts that aren't named
+    as LODs are never touched.
+
+    This is a name-substring heuristic, flagged in the handoff writeup as
+    worth a deliberate confirm.
     """
     if len(objects) <= 1:
         return objects
-    if not (is_speedtree or "tree" in element_name.lower()):
+    # "<base>_l0/_l1/_l2" LOD naming (SpeedTree files) only counts with sibling
+    # evidence, judged on the mesh names (they keep the art names) -- see
+    # import_gr2.sibling_lod_flags().
+    sibling_flags = sibling_lod_flags([ob.data.name if ob.data is not None else ob.name for ob in objects])
+    states = {}
+    for ob, (sibling_is_lod, sibling_is_lod0) in zip(objects, sibling_flags):
+        is_lod, is_lod0 = _lod_state(ob)
+        states[ob] = (is_lod or sibling_is_lod, is_lod0 or sibling_is_lod0)
+    has_lod_names = any(is_lod for is_lod, _ in states.values())
+    if not (is_speedtree or "tree" in element_name.lower() or has_lod_names):
         return objects
 
-    highest = max(objects, key=lambda ob: len(ob.data.polygons) if ob.data else 0)
-    kept = [highest]
+    def polygons(ob):
+        return len(ob.data.polygons) if ob.data else 0
+
+    lod0_objects = [ob for ob in objects if states[ob][1]]
+    highest = max(objects, key=polygons)
+    keepers = lod0_objects if lod0_objects else [highest]
+
+    kept = []
+    removed = []
     for ob in objects:
-        if ob is highest:
-            continue
-        if "_lod" in ob.name.lower() and "_lod0" not in ob.name.lower():
-            bpy.data.objects.remove(ob, do_unlink=True)
-        else:
+        if ob in keepers or not states[ob][0]:
             kept.append(ob)
+        else:
+            removed.append(ob)
+
+    # Worth a line, once per file per session: the file's LOD0 is NOT its most
+    # detailed LOD, so the polygon counts and the names disagree about which
+    # one is "the" model.
+    heavier = [ob for ob in removed if lod0_objects and polygons(ob) >= max(polygons(k) for k in lod0_objects)]
+    if heavier and element_name not in _lod_notes_seen:
+        _lod_notes_seen.add(element_name)
+        print(
+            "LOD note on %r: keeping %s (%d polys) as LOD0; removed %s with as many or more polygons -- "
+            "the file's LOD names and polygon counts disagree"
+            % (element_name, [k.data.name if k.data else k.name for k in lod0_objects],
+               max(polygons(k) for k in lod0_objects),
+               [(o.data.name if o.data else o.name, polygons(o)) for o in heavier])
+        )
+
+    for ob in removed:
+        bpy.data.objects.remove(ob, do_unlink=True)
     return kept
 
 
@@ -717,15 +594,18 @@ def _process_element(operator, context, resources_root, mesh_cache, light_cache,
     extension = resolved_target.rsplit(".", 1)[-1].lower() if "." in resolved_target else ""
 
     if extension == "lit":
-        # No file resolution needed at all -- a .lit-tagged element is
-        # just a marker to place a generic light, not a real asset on
-        # disk we read (see _LightCache's own note on why).
+        # Reached here only for a ".lit" element with no real light
+        # data of its own -- either ".spn_p" -> ".dyn"-expanded (never
+        # carries light data) or a direct element that somehow lacks
+        # its "light" object (see _process_area_element's own dispatch,
+        # which intercepts every direct ".lit" WITH real data before
+        # this function is ever called at all). No file resolution
+        # needed here either way -- a placeholder is just a marker
+        # light, not a real asset on disk we read.
         if not operator.area_create_lights:
             skip_counts["'.lit' skipped (Create Scene Lights disabled) (expected)"] += 1
             return []
-        light_ob = bpy.data.objects.new(light_cache.object_name(), light_cache.get())
-        _apply_transform(light_ob, transform)
-        return [light_ob]
+        return [_build_placeholder_light(light_cache, transform)]
 
     if extension == "mag":
         referenced = _resolve_mag_reference(resources_root, resolved_target)
@@ -768,87 +648,6 @@ def _process_element(operator, context, resources_root, mesh_cache, light_cache,
             _apply_transform(ob, transform)
 
     return objects
-
-
-def _process_terrain_element(operator, context, resources_root, element, transform, scale_factor, skip_counts):
-    # type: (Any, Any, str, area_types.AreaElement, area_types.ResolvedTransform, float, Counter) -> list
-    """
-    ".hms" elements aren't ".gr2" references at all -- confirmed
-    against the old source, not guessed: the real geometry lives at
-    resources/world/heightmaps/<element's own numeric SWTOR id>.obj,
-    looked up by the ELEMENT'S OWN id, not anything in its assetName
-    (unlike every other extension this addon handles). Imported through
-    Blender's built-in OBJ importer -- bpy.ops.wm.obj_import is the
-    only operator name that applies to our 4.5/5.2 LTS target (the
-    pre-4.0 import_scene.obj this addon's own old source also supported
-    for older Blender versions is irrelevant here).
-
-    Deliberately does NOT reuse mesh_cache -- each heightmap tile is
-    presumably unique to its own element id (no evidence of reuse
-    across elements, unlike the .gr2 props the cache exists for). Its
-    OWN scale_factor baking (below) is still needed though, matching
-    the exact same convention _MeshCache.store() uses for .gr2 meshes
-    -- CONFIRMED real bug this fixes: since this path never touched
-    mesh_cache at all, nothing was ever baking scale_factor into the
-    imported terrain geometry, so heightmaps silently ignored the
-    scene's override scale entirely while every other object type
-    correctly followed it.
-
-    Unlike the old source, which arbitrarily kept only the first
-    resulting object and silently abandoned any others as orphaned,
-    unlinked leaks if the .obj ever produced more than one -- this
-    keeps every resulting object. Not observed to matter in practice
-    (heightmaps appear to always be single-mesh), but costs nothing to
-    handle correctly rather than replicate a real bug.
-    """
-    heightmaps_folder = Path(resources_root) / "world" / "heightmaps"
-    if not heightmaps_folder.is_dir():
-        skip_counts["'.hms' skipped -- no resources/world/heightmaps folder found"] += 1
-        return []
-
-    obj_path = heightmaps_folder / ("%s.obj" % element.id)
-    if not obj_path.is_file():
-        skip_counts["'.hms' heightmap .obj not found on disk"] += 1
-        return []
-
-    objects_before = set(bpy.data.objects)
-    result = bpy.ops.wm.obj_import(filepath=str(obj_path))
-    # NOTE: the old source checked `result == "CANCELLED"` -- comparing
-    # a Blender operator's return value (always a set, e.g.
-    # {'CANCELLED'}) to a bare string, which can never be True. That
-    # check never actually fired in the old source; not replicated here.
-    if 'CANCELLED' in result:
-        skip_counts["'.hms' Blender's OBJ importer failed to import it"] += 1
-        return []
-
-    imported_objects = list(set(bpy.data.objects) - objects_before)
-    if not imported_objects:
-        skip_counts["'.hms' OBJ import produced no objects"] += 1
-        return []
-
-    if scale_factor != 1.0:
-        # Matches _MeshCache.store()'s own approach exactly: bake into
-        # the mesh vertex data, not Object.scale -- see this addon's
-        # confirmed convention (import_gr2.py's build(): scale_object
-        # bakes via transform_apply, Object.scale is reset to its
-        # natural value afterward). seen_meshes guards against
-        # transforming the same mesh data-block twice, same reasoning
-        # as _MeshCache.store(), in case a single .obj ever produces
-        # multiple objects sharing one mesh (not observed, but cheap
-        # to guard against here too).
-        scale_matrix = Matrix.Scale(scale_factor, 4)
-        seen_meshes = set()
-        for ob in imported_objects:
-            if ob.data is not None and id(ob.data) not in seen_meshes:
-                ob.data.transform(scale_matrix)
-                ob.data.update()
-                seen_meshes.add(id(ob.data))
-
-    for i, ob in enumerate(imported_objects):
-        ob.name = element.id if i == 0 else "%s.%03d" % (element.id, i)
-        _apply_transform(ob, transform)
-
-    return imported_objects
 
 
 def _process_fxspec_element(operator, context, resources_root, element, transform, scale_factor,
@@ -992,8 +791,9 @@ def _process_fxspec_element(operator, context, resources_root, element, transfor
 
 
 def _process_area_element(operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor,
-                           skip_counts, fxspec_mesh_cache, fxspec_bone_follower_cache, fxspec_warnings):
-    # type: (Any, Any, str, _MeshCache, _LightCache, area_types.AreaElement, area_types.ResolvedTransform, float, Counter, _MeshCache, dict, list) -> list
+                           skip_counts, fxspec_mesh_cache, fxspec_bone_follower_cache, fxspec_warnings,
+                           real_light_cache, light_warnings, hms_batch, area_name):
+    # type: (Any, Any, str, _MeshCache, _LightCache, area_types.AreaElement, area_types.ResolvedTransform, float, Counter, _MeshCache, dict, list, Any, list, HmsBatch, str) -> list
     """
     Handles one parsed AreaElement with its already-computed final
     transform: resolves ".spn_p" indirection if present (possibly
@@ -1008,7 +808,11 @@ def _process_area_element(operator, context, resources_root, mesh_cache, light_c
     asset_name = element.asset_name
 
     if asset_name.lower().endswith(".hms"):
-        return _process_terrain_element(operator, context, resources_root, element, transform, scale_factor, skip_counts)
+        # Native terrain (ops/import_hms.py). Deliberately ignores `transform`:
+        # heightmaps use their own authored transform, not the parent-composed
+        # one (see import_hms.hms_transform_for_element); `scale_factor` reaches
+        # it through hms_batch.
+        return process_terrain_element(context, hms_batch, element, area_name, skip_counts)
 
     if asset_name.lower().endswith(".fxp"):
         # Case 1 only (see _process_fxspec_element's own docstring) --
@@ -1023,6 +827,24 @@ def _process_area_element(operator, context, resources_root, mesh_cache, light_c
         return _process_fxspec_element(
             operator, context, resources_root, element, transform, scale_factor,
             fxspec_mesh_cache, fxspec_bone_follower_cache, skip_counts, fxspec_warnings,
+        )
+
+    if asset_name.lower().endswith(".lit") and element.light is not None:
+        # Case 1 only, same reasoning as ".fxp" above -- intercepted
+        # here, one level up from _process_element(), since that's
+        # where `element.light` is still in scope. A ".lit" reached via
+        # ".spn_p" -> ".dyn" expansion (Case 2) never carries light data
+        # at all (see types/area.py's LightInfo docstring) and still
+        # falls through to _process_element()'s own generic placeholder
+        # path below, unchanged -- same as a direct ".lit" element that
+        # somehow has no "light" object of its own (element.light is
+        # None), which also isn't intercepted here.
+        #
+        # Deferred import -- see this module's own top-of-file note.
+        from .import_room_lights import _process_light_element
+        return _process_light_element(
+            operator, context, resources_root, real_light_cache, light_cache,
+            element, transform, scale_factor, skip_counts, light_warnings,
         )
 
     if not asset_name.lower().endswith(".spn_p"):
@@ -1097,8 +919,8 @@ def _process_area_element(operator, context, resources_root, mesh_cache, light_c
 # ---------------------------------------------------------------------------
 
 def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, light_budget,
-         fxspec_mesh_cache, fxspec_bone_follower_cache):
-    # type: (Any, Any, str, str, float, _MeshCache, _LightBudget, _MeshCache, dict) -> bool
+         fxspec_mesh_cache, fxspec_bone_follower_cache, real_light_cache, hms_batch):
+    # type: (Any, Any, str, str, float, _MeshCache, _LightBudget, _MeshCache, dict, Any, HmsBatch) -> bool
     """
     Imports ONE area json file. Assumes `resources_root` is already a
     valid directory and bundled_data/ is already confirmed available --
@@ -1127,6 +949,20 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
     _process_fxspec_element's own docstring for why they're kept
     separate from this function's own `mesh_cache` rather than reusing
     it directly.
+
+    `real_light_cache` (ops/import_room_lights.py's _RealLightCache) is
+    likewise shared across the whole batch -- a reused light preset
+    (the same torch, say) is exactly as likely to repeat across files
+    in one zone as within a single one, same reasoning as mesh_cache.
+    Only its area-name label (used for freshly-built data-block names,
+    not as part of its cache key) is updated per file, via
+    set_area_name() below.
+
+    `hms_batch` (ops/import_hms.py's HmsBatch) is likewise shared across
+    the whole batch: it carries the Generate Terrain / Enable DYD Scatter
+    switches, the area index and the parsed area/room .dat caches that every
+    `.hms` element in every file of the batch reuses. Its start/finish
+    bookkeeping belongs to the caller (execute()).
 
     Returns True on success, False on failure (mirrors
     import_gr2.py/import_cha.py's own load() return convention).
@@ -1241,11 +1077,13 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
         return "general"
 
     light_cache = _LightCache(area_name, scale_factor)
+    real_light_cache.set_area_name(area_name)
 
     skip_counts = Counter()
     crashed_elements = []
     total_objects = []
     fxspec_warnings = []
+    light_warnings = []
 
     for element in elements:
         transform = transforms.get(element.id)
@@ -1264,13 +1102,14 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
             objects = _process_area_element(
                 operator, context, resources_root, mesh_cache, light_cache, element, transform, scale_factor,
                 skip_counts, fxspec_mesh_cache, fxspec_bone_follower_cache, fxspec_warnings,
+                real_light_cache, light_warnings, hms_batch, area_name,
             )
         except Exception as exc:
             crashed_elements.append("%s (%s): %s" % (element.id, element.asset_name, exc))
             continue
 
         for ob in objects:
-            # ImportGR2_load() links freshly-created objects into
+            # import_gr2.load() links freshly-created objects into
             # whatever collection is active in the view layer at import
             # time -- move them to this area's proper collection instead,
             # same pattern as import_cha.py's assemble_collections().
@@ -1280,7 +1119,7 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
             # "does this object have ANY collection membership at all",
             # rather than "is it specifically in [target] collection".
             # A freshly-imported object arrives already linked to
-            # context.collection (from ImportGR2_load's own default
+            # context.collection (from import_gr2.load()'s own default
             # linking), so that guard was always False for it -- meaning
             # it never got linked to its proper collection at all, and the
             # very next loop then unconditionally unlinked it from
@@ -1371,6 +1210,18 @@ def load(operator, context, filepath, resources_root, scale_factor, mesh_cache, 
             print("  " + w)
         if len(fxspec_warnings) > 20:
             print("  ... and %d more (see full console output)" % (len(fxspec_warnings) - 20))
+
+    if light_warnings:
+        # Same reasoning as fxspec_warnings above -- a texture that
+        # couldn't be resolved/loaded, or a real light build that fell
+        # back to a placeholder, are both worth digging into
+        # specifically; every category is also already counted into
+        # skip_counts below under its own stable label.
+        print("Area Assembler [%s]: %d real-light warning(s) needing attention:" % (file_label, len(light_warnings)))
+        for w in light_warnings[:20]:
+            print("  " + w)
+        if len(light_warnings) > 20:
+            print("  ... and %d more (see full console output)" % (len(light_warnings) - 20))
 
     if skip_counts:
         print("Area Assembler [%s]: elements skipped, by reason:" % file_label)
@@ -1487,11 +1338,14 @@ class ImportAREA(bpy.types.Operator):
     area_create_lights: bpy.props.BoolProperty(
         name="Create Scene Lights",
         description=(
-            "Places a generic placeholder Point light for every \".lit\"-tagged "
-            "element (real per-light color/intensity data isn't available yet -- "
-            "richer light types are planned as separate future work). Lights "
-            "beyond a per-file threshold get their Collection auto-excluded from "
-            "the view layer to protect viewport performance"
+            "Places a real SWTOR-style light (color/intensity/shadow/falloff & "
+            "illumination cookie textures, built from the bundled lighting "
+            "template) for every \".lit\"-tagged element that carries real "
+            "per-light JSON data, falling back to a generic placeholder Point "
+            "light if that data is missing or the real light fails to build "
+            "(see console). Lights beyond a per-file threshold get their "
+            "Collection auto-excluded from the view layer to protect viewport "
+            "performance"
         ),
         default=True,
     )
@@ -1511,6 +1365,21 @@ class ImportAREA(bpy.types.Operator):
         default=True,
     )
 
+    area_name_as_filename: bpy.props.BoolProperty(
+        name="Name Objects As Filenames",
+        description=(
+            "Names each imported object after its .gr2 file instead of the model's internal "
+            "'art name' (the mesh data always keeps the art name). Every placed copy of a file "
+            "then carries the same name -- without this, the first copy of a file is named by its "
+            "art name (\"LOD[0]\", \"trunk002\", \"Object011\") and every later copy by its filename.\n\n"
+            "Files holding several meshes (LOD levels, plaque + bust...) only get the main mesh "
+            "renamed: the LOD0 mesh if the file has one, otherwise the first.\n\n"
+            "Starts from this add-on's \"Name Imported Objects As Filenames\" preference each time "
+            "the dialog opens; change it here to override that for this import only"
+        ),
+        default=False,
+    )
+
     area_merge_multi_mesh_objects: bpy.props.BoolProperty(
         name="Merge Multi-Mesh Objects",
         description=(
@@ -1521,6 +1390,40 @@ class ImportAREA(bpy.types.Operator):
             "sub-part names don't always reflect anything meaningful)"
         ),
         default=False,
+    )
+
+    area_generate_terrain: bpy.props.BoolProperty(
+        name="Generate Terrain",
+        description=(
+            "Builds the native heightmap terrain (geometry and layered materials) for every room file that "
+            "lists a \".hms\" element, straight from the game's own .dat files under "
+            "<Resources Folder>/world/areas -- no other files or conversion needed. The first import reads "
+            "every area.dat once to learn which area each heightmap belongs to (a few seconds) and "
+            "remembers the result. Off, heightmap elements are skipped"
+        ),
+        default=True,
+    )
+
+    area_enable_dyd_scatter: bpy.props.BoolProperty(
+        name="Enable DYD Scatter",
+        description=(
+            "Adds the Geometry Nodes grass/rock/foliage scatter (the game's \"dynamic detail\") on top of "
+            "each terrain tile. Needs Generate Terrain. Turn off to import just the terrain, e.g. to keep "
+            "a large area light in the viewport"
+        ),
+        default=True,
+    )
+
+    area_dyd_max_instances: bpy.props.IntProperty(
+        name="Max DYD Instances Per Tile",
+        description=(
+            "Safety limit: if a tile's scatter is estimated to put more than this many instances in the "
+            "viewport (at its Viewport Density), that tile's Viewport Density is lowered just enough to fit "
+            "(a sparser viewport preview) instead of risking a hang or crash. Render density is never "
+            "changed. 0 turns the limit off"
+        ),
+        default=DEFAULT_MAX_VIEWPORT_INSTANCES,
+        min=0,
     )
 
     area_hide_collections_after_import: bpy.props.BoolProperty(
@@ -1571,6 +1474,11 @@ class ImportAREA(bpy.types.Operator):
     job_results_accumulate: bpy.props.BoolProperty(options={'HIDDEN'}, default=False)
 
     def invoke(self, context, event):
+        # The dialog opens with this add-on's own preference for naming objects
+        # after files (Preferences > .gr2 import), like the .gr2 importer's own
+        # dialog does; it can be overridden for the run in the dialog itself.
+        prefs = context.preferences.addons["swtor_io_tools"].preferences
+        self.area_name_as_filename = prefs.gr2_name_as_filename
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
@@ -1631,30 +1539,78 @@ class ImportAREA(bpy.types.Operator):
         fxspec_mesh_cache = _MeshCache(scale_factor=1.0)
         fxspec_bone_follower_cache = {}
 
-        batch_start_time = time.time()
-        succeeded = []
-        failed = []
-        for path in paths:
-            if load(self, context, path, resources_root, scale_factor, mesh_cache, light_budget,
-                    fxspec_mesh_cache, fxspec_bone_follower_cache):
-                succeeded.append(path)
-            else:
-                failed.append(path)
-        batch_elapsed_time = time.time() - batch_start_time
+        # Deferred import -- see this module's own top-of-file note.
+        from .import_room_lights import _RealLightCache
+        real_light_cache = _RealLightCache(resources_root)
 
-        if len(paths) > 1:
-            print("Area Assembler: batch of %d file(s) complete." % len(paths))
-            print("TOTAL TIME: %s" % _format_duration(batch_elapsed_time))
-            print()
+        # Native .hms terrain: settings + area index + .dat caches shared by
+        # every file in the batch. Its setup is lazy (nothing happens unless
+        # a file actually has an .hms element) and finish() always runs, in
+        # the finally below, after the materials pass.
+        hms_batch = HmsBatch(
+            resources_root, scale_factor,
+            generate_terrain=self.area_generate_terrain,
+            enable_scatter=self.area_enable_dyd_scatter,
+            max_viewport_instances=self.area_dyd_max_instances,
+        )
 
-        if succeeded and self.area_process_materials:
-            materials_start_time = time.time()
-            results = apply_materials_by_name_to_gr2_objects(job_results['objs_names'])
-            materials_elapsed_time = time.time() - materials_start_time
-            print("Area Assembler: materials processing complete.")
-            print("MATERIALS TIME: %s" % _format_duration(materials_elapsed_time))
-            print()
-            _summarize_and_report(self, results)
+        try:
+            batch_start_time = time.time()
+            succeeded = []
+            failed = []
+            for path in paths:
+                if load(self, context, path, resources_root, scale_factor, mesh_cache, light_budget,
+                        fxspec_mesh_cache, fxspec_bone_follower_cache, real_light_cache, hms_batch):
+                    succeeded.append(path)
+                else:
+                    failed.append(path)
+            batch_elapsed_time = time.time() - batch_start_time
+
+            # Every load() has finished, so every instantiate() of the batch has
+            # happened: the cached meshes no longer need protecting from purges
+            # (see _MeshCache.store()). Done before the final purge below so
+            # that purge can still reclaim the meshes of excluded objects.
+            mesh_cache.release()
+            fxspec_mesh_cache.release()
+
+            if real_light_cache.needs_final_purge():
+                # The one safe point to reclaim everything real-light
+                # building left unpurged during the loop above (duplicate
+                # shared node groups, superseded default template textures)
+                # -- see light_templates.build_light_from_template()'s own
+                # docstring for the confirmed real bug that made purging
+                # mid-loop unsafe (_MeshCache's cached-but-momentarily-
+                # userless mesh data getting deleted out from under it).
+                # Every load() call above has already finished by this
+                # point, so every _MeshCache instantiate() across the whole
+                # batch has already happened too -- same timing already
+                # proven safe for the materials pass just below, which also
+                # only ever runs after this same loop.
+                bpy.data.orphans_purge(do_recursive=True)
+
+            if len(paths) > 1:
+                print("Area Assembler: batch of %d file(s) complete." % len(paths))
+                print("TOTAL TIME: %s" % _format_duration(batch_elapsed_time))
+                print()
+
+            if succeeded and self.area_process_materials:
+                materials_start_time = time.time()
+                results = apply_materials_by_name_to_gr2_objects(job_results['objs_names'])
+                materials_elapsed_time = time.time() - materials_start_time
+                print("Area Assembler: materials processing complete.")
+                print("MATERIALS TIME: %s" % _format_duration(materials_elapsed_time))
+                print()
+                _summarize_and_report(self, results)
+        finally:
+            # Releases the fake users that kept the terrain datablocks alive
+            # through the purges above and the materials pass, re-excludes the
+            # shared DYD assets collection, and prints the terrain summary.
+            # Runs even if the import raised part-way through.
+            mesh_cache.release()           # idempotent -- covers the raised-part-way case
+            fxspec_mesh_cache.release()
+            hms_batch.finish(context)
+            for level, message in hms_batch.notices:
+                self.report({level}, message)
 
         bpy.context.scene.swtor_io_last_job = json.dumps(job_results)
 

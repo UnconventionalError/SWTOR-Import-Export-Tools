@@ -61,15 +61,14 @@ from bpy.props import BoolProperty, CollectionProperty, StringProperty
 from mathutils import Euler, Matrix
 
 from ..types import fxspec as fxspec_types
-from .import_area import _MeshCache, _job_results_key
-from .import_cha import resolve_resource_path
+from .import_gr2 import _MeshCache, _job_results_key
 from .import_gr2 import load as ImportGR2_load
 from .process_materials import apply_materials_by_name_to_gr2_objects, _summarize_and_report
-from ..types.shared import job_results
+from ..types.shared import job_results, resolve_resource_path
 
 
 # ---------------------------------------------------------------------------
-# .gr2 import (mirrors ops/import_area.py's own _import_gr2, minus the
+# .gr2 import (mirrors ops/import_gr2.py's own _import_gr2, minus the
 # "Merge Multi-Mesh Objects" option -- not carried over in this first
 # pass; every returned sub-object from a multi-mesh .gr2 gets parented
 # independently instead, same fallback behaviour _MeshCache itself
