@@ -182,7 +182,7 @@ class DynVisual:
 
     def __init__(self, path, name, position, rotation, scale, extension):
         self.path = path            # resource path, e.g. "\art\static\...\x.gr2" --
-                                     # deliberately NOT slash-normalized here; import_cha.py's
+                                     # deliberately NOT slash-normalized here; types/shared.py's
                                      # resolve_resource_path() already handles either style
         self.name = name            # dynVisualName if present, else derived from path
         self.position = position    # (x, y, z), (0.0, 0.0, 0.0) if the source entry omits it
@@ -278,13 +278,107 @@ def expand_dyn(dyn_fqn):
 # Area json element parsing (handoff §2c)
 # ---------------------------------------------------------------------------
 
+class LightInfo:
+    """
+    Parsed contents of one element's sibling "light" object in a room
+    export -- present only on direct ".lit" elements (mirrors "fx" on
+    direct ".fxp" elements; a ".lit" reached indirectly through
+    ".spn_p" -> ".dyn" expansion is a synthetic DynVisual by the time
+    it's handled, which carries no light data at all -- same Case
+    1/Case 2 split fxspec integration already has).
+
+    Deliberately does NOT carry "type" (OMNI/SPOT), "range",
+    "innerAngle", or "outerAngle" -- confirmed across a 1625-light,
+    220-file sample that these don't track anything usable: 5 of the
+    only 5 elements anywhere with non-zero inner/outerAngle are
+    actually typed OMNI, not SPOT, and "range" is 0 on literally every
+    sample seen. Every real light is built identically regardless of
+    "type" (Crunch's own call). "sourceOffset" IS carried (a genuine
+    0..1 spread on ~5% of lights in that sample -- looks like it could
+    be a soft-shadow/physical-source-size control) even though nothing
+    consumes it yet -- nowhere in the bundled lighting template's node
+    graph reads a size/radius input for it, so it's parsed and kept
+    available rather than re-deriving it later once there is somewhere
+    to route it.
+    """
+    __slots__ = ("color", "intensity", "casts_shadows", "falloff_map", "ramp_map",
+                 "illumination_map", "source_offset")
+
+    def __init__(self, color, intensity, casts_shadows, falloff_map, ramp_map,
+                 illumination_map, source_offset):
+        self.color = color                        # (r, g, b) -- alpha dropped, never seen as
+                                                    # anything but 1 and nothing downstream (the
+                                                    # bundled node group's Color input) takes one
+        self.intensity = intensity                 # float -- feeds the node group's "strength"
+                                                    # input (Cycles) and derives light.energy
+                                                    # (Eevee parity) directly, no per-type scaling
+        self.casts_shadows = casts_shadows          # bool -- feeds light.use_shadow directly
+        self.falloff_map = falloff_map              # "\art\lights\....dds" or None
+        self.ramp_map = ramp_map                    # "\art\lights\....dds" or None -- template's
+                                                      # own RampMap group input is unconnected
+                                                      # (confirmed via node dump); resolved/loaded
+                                                      # anyway so nothing needs re-deriving once
+                                                      # that's wired up
+        self.illumination_map = illumination_map    # "\art\lights\....dds" or None
+        self.source_offset = source_offset          # float, 0.0 default -- see class docstring
+
+
+def _parse_light(raw):
+    # type: (object) -> Optional[LightInfo]
+    """
+    Parses one element's raw "light" dict (from its sibling "light" key
+    in the room export), or returns None if `raw` isn't a dict at all
+    (the key was absent, or present but malformed).
+
+    Deliberately lenient on missing/malformed individual fields rather
+    than rejecting the whole light on any single bad value -- soft-fail
+    like everything else in this addon: a light with e.g. no
+    "castsShadows" key still gets built, just with a sensible default,
+    rather than silently vanishing from the room. Every field HAS been
+    observed present on every real ".lit" element seen so far (100% of
+    1625 samples across 220 files); these defaults are a safety net,
+    not the expected path.
+    """
+    if not isinstance(raw, dict):
+        return None
+
+    color_raw = raw.get("color")
+    if isinstance(color_raw, dict):
+        try:
+            color = (float(color_raw.get("r", 1.0)), float(color_raw.get("g", 1.0)), float(color_raw.get("b", 1.0)))
+        except (TypeError, ValueError):
+            color = (1.0, 1.0, 1.0)
+    else:
+        color = (1.0, 1.0, 1.0)
+
+    try:
+        intensity = float(raw.get("intensity", 1.0))
+    except (TypeError, ValueError):
+        intensity = 1.0
+
+    try:
+        source_offset = float(raw.get("sourceOffset", 0.0))
+    except (TypeError, ValueError):
+        source_offset = 0.0
+
+    return LightInfo(
+        color=color,
+        intensity=intensity,
+        casts_shadows=bool(raw.get("castsShadows", True)),
+        falloff_map=raw.get("falloffMap") or None,
+        ramp_map=raw.get("rampMap") or None,
+        illumination_map=raw.get("illuminationMap") or None,
+        source_offset=source_offset,
+    )
+
+
 class AreaElement:
     """One raw element from an area json, as-parsed (no resolution/composition yet)."""
     __slots__ = ("id", "asset_name", "parent_id", "position", "rotation", "scale", "final_position",
-                 "fx_spec_name")
+                 "fx_spec_name", "light", "asset_id")
 
     def __init__(self, id, asset_name, parent_id, position, rotation, scale, final_position,
-                 fx_spec_name=None):
+                 fx_spec_name=None, light=None, asset_id=None):
         self.id = id
         self.asset_name = asset_name        # e.g. "\art\static\...\x.gr2" or "\spn\...\x.spn_p"
         self.parent_id = parent_id          # "0" for root elements
@@ -304,6 +398,14 @@ class AreaElement:
                                              # not covered by this field at all -- that path resolves
                                              # through the separately-sourced bundled dyn data instead,
                                              # not this one)
+        self.asset_id = asset_id            # the export's own numeric "assetId" as a string, or None. Only
+                                             # consumed by ".hms" terrain: every .hms element in an area
+                                             # shares that area's heightmap placeholder asset id, which is
+                                             # how ops/import_hms.py works out which area.dat it belongs to
+        self.light = light                  # LightInfo or None -- only present on elements carrying
+                                             # a sibling "light" object (seen so far on direct ".lit"
+                                             # elements only; same Case 1/Case 2 split as fx_spec_name
+                                             # above, see LightInfo's own docstring)
 
 
 def parse_area_json(data):
@@ -344,10 +446,16 @@ def parse_area_json(data):
         if isinstance(fx, dict):
             fx_spec_name = fx.get("fxSpecName") or None
 
+        light = _parse_light(raw.get("light"))
+
+        raw_asset_id = raw.get("assetId")
+        asset_id = str(raw_asset_id) if raw_asset_id is not None else None
+
         elements.append(AreaElement(
             id=id_, asset_name=asset_name, parent_id=parent_id,
             position=position, rotation=rotation, scale=scale,
-            final_position=final_position, fx_spec_name=fx_spec_name,
+            final_position=final_position, fx_spec_name=fx_spec_name, light=light,
+            asset_id=asset_id,
         ))
     return elements
 

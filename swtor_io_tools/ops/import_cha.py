@@ -21,82 +21,10 @@ import bmesh
 from mathutils import Vector, Matrix
 
 from .import_gr2 import load as ImportGR2_load
-from ..types.mat import read_mat_full, read_mat_summary
-from ..types.shader_templates import ShaderTemplateError, find_main_shader_group_node, get_or_build_shader_material, has_swtor_shader_group
-from ..types.shared import job_results
-
-
-# ---------------------------------------------------------------------------
-# Path resolution (spec §4)
-# ---------------------------------------------------------------------------
-
-def resolve_resource_path(resources_root, relative_path):
-    # type: (str, Optional[str]) -> Optional[str]
-    """
-    Resolves a Jedipedia json path (e.g. "/art/dynamic/head/model/x.gr2")
-    against a local resources root folder that contains an "art" subfolder
-    directly, mirroring the game's own asset layout.
-
-    Defensively strips:
-    - a single leading slash or backslash
-    - a redundant leading "resources" path segment, in case a path
-      includes one (historically seen on the old meta.skeletonModel
-      field, before skeleton resolution moved to the .dyc-based lookup
-      in import_skeleton() -- kept as a general safety net)
-
-    Returns None if relative_path is falsy, so callers can skip absent
-    optional paths without extra checks.
-    """
-    if not relative_path:
-        return None
-
-    # Normalize to forward slashes regardless of which slash style the
-    # json used, so splitting is consistent.
-    normalized = relative_path.replace("\\", "/").lstrip("/")
-
-    parts = normalized.split("/")
-    if parts and parts[0].lower() == "resources":
-        parts = parts[1:]
-
-    return str(Path(resources_root, *parts))
-
-
-def resolve_resource_path_multi(resources_root, legacy_resources_root, relative_path):
-    # type: (str, Optional[str], Optional[str]) -> Tuple[Optional[str], str]
-    """
-    Tries relative_path (see resolve_resource_path() above -- same
-    normalization, just checked against two roots instead of one) under
-    resources_root first, then legacy_resources_root as a fallback if it
-    doesn't exist there.
-
-    Returns (resolved_path, root_used) -- root_used is whichever root
-    the file actually turned up under, mirroring types/mat.py's
-    resolve_mat_path()'s exact reasoning: callers go on to resolve this
-    same material's OTHER assets (its DDS textures) against that same
-    root, on the assumption that a material and everything it references
-    ship together within the same resources layer. Deliberately reuses
-    resolve_resource_path() for the actual path construction rather than
-    reimplementing it, and deliberately does NOT switch to reconstructing
-    the path from a fixed art/shaders/materials/<name>.mat convention
-    (unlike resolve_mat_path()) -- this resolves the *literal* relative
-    path a Jedipedia json entry provides, which isn't guaranteed to
-    always match that convention.
-
-    If relative_path can't be found under either root (including when
-    relative_path itself is falsy), falls back to
-    resolve_resource_path(resources_root, relative_path) unchecked and
-    root_used=resources_root -- matches this project's pre-legacy-
-    support behavior for that failure case, so a missing file never
-    silently changes which root subsequent lookups for the same material
-    are attempted against.
-    """
-    for root in (resources_root, legacy_resources_root):
-        if not root:
-            continue
-        candidate = resolve_resource_path(root, relative_path)
-        if candidate is not None and Path(candidate).is_file():
-            return candidate, root
-    return resolve_resource_path(resources_root, relative_path), resources_root
+from .material_builder import get_or_create_material, is_head_object_name
+from .process_materials import get_resources_dirs
+from ..types.mat import read_mat_full
+from ..types.shared import job_results, resolve_resource_path, resolve_resource_path_multi
 
 
 # ---------------------------------------------------------------------------
@@ -183,378 +111,16 @@ def read(filepath):
 
 
 # ---------------------------------------------------------------------------
-# Material building (spec §6)
+# NPC material policy: json + .mat merge, head detection
+#
+# Moved here from ops/material_builder.py -- both only make sense for this
+# importer (only it has Jedipedia json; ops/process_materials.py builds
+# straight from .mat data). The builder itself takes finished mat_info.
 # ---------------------------------------------------------------------------
-
-def _load_or_get_image(resources_root, legacy_resources_root, relative_path):
-    """
-    Loads a .dds texture, trying resources_root then legacy_resources_root
-    (see resolve_resource_path_multi()) -- per-ASSET fallback, not a
-    single root decided once for the whole material: a real material has
-    turned up whose own .mat file resolves fine under resources_root, but
-    whose textures (under a completely different resources subtree --
-    player_character/head/texture/ vs the .mat's own shaders/materials/)
-    only exist under legacy_resources_root. So the two can't be assumed
-    to travel together the way ops/process_materials.py's .mat-file-only
-    entry points assumed for their own root_used.
-
-    Reuses an already-loaded Blender image with the same filename if one
-    exists (mirrors the dedup-by-basename convention the original
-    importer used for images -- distinct from the new dedup-by-.mat-
-    filename convention used for materials themselves, see
-    get_or_create_material()).
-
-    Sets alpha_mode/colorspace exactly as the old custom node's per-map
-    update_*Map callbacks did for every SWTOR texture (CHANNEL_PACKED
-    alpha, Non-Color colorspace) -- since assigning an image directly to
-    an external Image Texture node's .image no longer goes through those
-    callbacks, this has to happen here instead.
-    """
-    path, _root_used = resolve_resource_path_multi(resources_root, legacy_resources_root, relative_path)
-    if not path:
-        return None
-    name = Path(path).name
-    existing = bpy.data.images.get(name)
-    if existing:
-        return existing
-    try:
-        image = bpy.data.images.load(path)
-    except RuntimeError:
-        # Genuinely missing from both roots (Path.is_file() failed under
-        # both in resolve_resource_path_multi() above) -- soft-fail:
-        # callers leave the Image Texture node unassigned, same as an
-        # optional map simply being absent, rather than letting this
-        # abort the entire import over one missing file. Reported by
-        # get_or_create_material()'s caller instead of raised here.
-        return None
-    image.alpha_mode = 'CHANNEL_PACKED'
-    image.colorspace_settings.name = 'Non-Color'
-    return image
-
-
-def _is_first_pixel_white(image):
-    """
-    True if `image`'s first pixel's Red channel is pure white (1.0),
-    False if pure black (0.0). Raises ValueError otherwise -- SWTOR's
-    Rotation Map opacity-channel background is expected to be exactly
-    one or the other by design, never something in between.
-
-    Used to auto-detect SWTOR's "modernized" head SkinB materials, which
-    use an inverted opacity convention for eyelash detail (black mask on
-    white background) versus the older convention (white mask on black
-    background). A fresh, non-deprecated copy of the original custom
-    node's is_first_pixel_white(), used here as a one-shot check at
-    import time rather than a live-updating callback (see
-    get_or_create_material()'s use of it).
-    """
-    first_red = image.pixels[0]
-    if first_red == 1.0:
-        return True
-    elif first_red == 0.0:
-        return False
-    else:
-        raise ValueError(
-            f"Rotation Map '{image.name}': first pixel's Red channel is "
-            f"neither pure black nor pure white (value={first_red})"
-        )
-
-
-def _get_white_fallback_image():
-    """
-    Matches the old custom node's Complexion Map fallback: a plain white
-    4x4 image, used so SkinB's diffuse*complexion multiply is a no-op
-    when no Complexion Map is present in the json data -- a solid black
-    fallback (what an empty Image Texture node would otherwise output)
-    would multiply the whole diffuse color to black instead.
-    """
-    existing = bpy.data.images.get('white.dds')
-    if existing:
-        return existing
-    image = bpy.data.images.new('white.dds', 4, 4)
-    image.generated_color = [1.0, 1.0, 1.0, 1.0]
-    return image
-
-
-# Default map assets (spec §6 extension, per Crunch): auto-populated into
-# an optional map's Image Texture node when a material's json data doesn't
-# specify that ddsPaths key at all. Keyed by the same json_key used in
-# DERIVED_CONFIGS' "maps" tuples, so this isn't SkinB-specific -- any
-# derived type's optional map can get a default here (e.g. Creature's
-# directionMap) just by adding an entry, no other code changes needed.
-#d
-# Paths are relative to the resources root, same convention as every
-# other ddsPaths entry -- resolve_resource_path() normalizes slashes and
-# strips a redundant leading "resources" segment regardless.
-DEFAULT_MAP_ASSETS = {
-    "complexionMap": "art/defaultassets/white.dds",
-    "facepaintMap": "art/defaultassets/default_facepaint.dds",
-    "ageMap": "art/defaultassets/default_age.dds",
-}
-
-
-def _load_default_map_image(resources_root, legacy_resources_root, json_key):
-    """
-    Loads the fallback image for an optional map key that's absent from
-    a material's json ddsPaths, per DEFAULT_MAP_ASSETS above. Tries
-    resources_root then legacy_resources_root, same as _load_or_get_image().
-
-    Returns None -- same as the map simply being absent -- if json_key
-    has no default asset registered, or if its default asset file isn't
-    actually present under either root (e.g. Crunch hasn't dropped the
-    defaultassets folder in yet); callers fall back to whatever behavior
-    they had before this existed.
-    """
-    relative_path = DEFAULT_MAP_ASSETS.get(json_key)
-    if relative_path is None:
-        return None
-    try:
-        return _load_or_get_image(resources_root, legacy_resources_root, relative_path)
-    except (OSError, RuntimeError):
-        return None
-
-
-def _set_palette(group_node, other_values, index, include_metallic_specular):
-    """
-    Sets a SWTOR shader group node's Palette<index> input socket
-    defaults (e.g. "Palette1 Hue") -- Koda Shaders' naming convention,
-    adopted across the board per Crunch, including single-palette
-    derived types (Eye/HairC/SkinB), which still get the "Palette1 "
-    prefix despite only having one palette.
-    """
-    prefix = "palette%d" % index
-    socket_prefix = f"Palette{index} "
-
-    other_palette = other_values[prefix]
-    group_node.inputs[f'{socket_prefix}Hue'].default_value = float(other_palette[0])
-    group_node.inputs[f'{socket_prefix}Saturation'].default_value = float(other_palette[1])
-    group_node.inputs[f'{socket_prefix}Brightness'].default_value = float(other_palette[2])
-    group_node.inputs[f'{socket_prefix}Contrast'].default_value = float(other_palette[3])
-
-    specular = other_values[prefix + "Specular"]
-    group_node.inputs[f'{socket_prefix}Specular'].default_value = [
-        float(specular[0]), float(specular[1]), float(specular[2]), 1.0,
-    ]
-
-    if include_metallic_specular:
-        metallic_specular = other_values[prefix + "MetallicSpecular"]
-        group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = [
-            float(metallic_specular[0]),
-            float(metallic_specular[1]),
-            float(metallic_specular[2]),
-            1.0,
-        ]
-
-
-def _set_animated_uv_inputs(new_mat, group_node, other_values):
-    """
-    Wires AnimatedUV's otherValues onto both of its group nodes -- the
-    main shader group (tint inputs) AND the sibling 'TransformAllUVs'
-    group (per-layer UV scroll/rotation), looked up by its known fixed
-    Blender node name (a SECOND top-level group node with real inputs to
-    set is specific to this shader type; every other DERIVED_CONFIGS
-    entry only has one, or a sibling detour group -- DirectionMapUV --
-    that nothing here ever sets inputs on).
-
-    Two real ambiguities resolved with a specific, deliberately-flagged
-    choice rather than a silent guess -- confirm visually once a
-    textured AnimatedUV material is actually rendered, adjust here if
-    wrong:
-      - animTexTint0/animTexTint2 are the .mat's own vector4 (RGBA)
-        values, but feed a NodeSocketVector (3-component) input on the
-        shader group -- the alpha component is dropped, only RGB used.
-      - animTexUVScrollSpeed{n}/animTexUVRotationPivot{n} sockets on
-        TransformAllUVs are 2-dimensional Vector sockets (confirmed via
-        real testing -- NOT 3-component; an earlier version of this
-        function wrongly assumed 3D and padded with Z=0, which raises
-        "sequences of dimension 0 should contain 2 items, not 3" and
-        crashes this whole function on its very first statement, silently
-        preventing every value after it -- scroll, pivot, rotation speed,
-        AND all three tints -- from ever being set). Matches the .mat's
-        own genuinely-2-component "uvscale" data (U, V) exactly -- no
-        padding needed at all.
-
-    Also note: the .mat's own semantic is "animTexRotationPivot{n}", but
-    TransformAllUVs' socket is named "animTexUVRotationPivot{n}" (extra
-    "UV") -- a deliberate explicit mapping below, not a typo.
-
-    Untouched, left at the template's own defaults, since neither has any
-    .mat correspondence at all: TransformAllUVs' 'Animation Offset', and
-    the main group's "User Controls" panel (Roughness/Emission Strength/
-    Backface Culling) -- the latter's own panel name signals these are
-    meant to be hand-tuned by whoever's editing the material in Blender,
-    not driven by SWTOR's own material data.
-
-    animFresnelHue0/animFresnelHue1/BloomMaterialParams are captured into
-    otherValues (types/mat.py's generic Tier 2 fallback) but have no
-    corresponding socket on either group yet -- same as FresnelGradient's
-    own Image Texture node (present, unconnected) -- nothing to do with
-    any of them here until that part of the shader is actually built.
-    """
-    transform_uvs_node = new_mat.node_tree.nodes.get("TransformAllUVs")
-    if transform_uvs_node is None:
-        raise ShaderTemplateError(
-            f"'{new_mat.name}' is missing its 'TransformAllUVs' node -- "
-            f"the template .blend may be corrupted or out of date."
-        )
-
-    for i in range(3):
-        scroll = other_values.get(f"animTexUVScrollSpeed{i}")
-        if scroll is not None:
-            transform_uvs_node.inputs[f'animTexUVScrollSpeed{i}'].default_value = [float(scroll[0]), float(scroll[1])]
-
-        pivot = other_values.get(f"animTexRotationPivot{i}")
-        if pivot is not None:
-            transform_uvs_node.inputs[f'animTexUVRotationPivot{i}'].default_value = [float(pivot[0]), float(pivot[1])]
-
-        rotation_speed = other_values.get(f"animTexRotationSpeed{i}")
-        if rotation_speed is not None:
-            transform_uvs_node.inputs[f'animTexRotationSpeed{i}'].default_value = float(rotation_speed)
-
-    tint0 = other_values.get("animTexTint0")
-    if tint0 is not None:
-        group_node.inputs['animTexTint0'].default_value = [float(tint0[0]), float(tint0[1]), float(tint0[2])]
-
-    tint1 = other_values.get("animTexTint1")
-    if tint1 is not None:
-        group_node.inputs['animTexTint1'].default_value = float(tint1)
-
-    tint2 = other_values.get("animTexTint2")
-    if tint2 is not None:
-        group_node.inputs['animTexTint2'].default_value = [float(tint2[0]), float(tint2[1]), float(tint2[2])]
-
-
-# Per-derived-type configuration, replacing the original's per-branch node
-# wiring (largely copy-pasted across ~700 lines) with a single data-driven
-class UnrecognizedDerivedTypeError(Exception):
-    """
-    Raised by get_or_create_material() specifically when `derived` isn't
-    a key DERIVED_CONFIGS covers at all (distinct from KNOWN_UNBUILT_
-    DERIVED, types/mat.py -- that bucket is caught earlier, before this
-    function is ever called).
-
-    A DISTINCT exception type on purpose, not a plain ValueError: Blender
-    itself raises plain ValueError for plenty of unrelated failures (e.g.
-    assigning a wrongly-sized sequence to a node socket's default_value)
-    -- catching bare ValueError to mean "unrecognized shader type" would
-    silently mislabel a real bug as "not yet supported" instead of
-    surfacing it as an actual error (confirmed real case: a 3-item list
-    assigned to a 2-dimensional Vector socket in
-    _set_animated_uv_inputs() got reported as "recognized but
-    not-yet-supported shader type" instead of the genuine bug it was).
-    ops/process_materials.py's _build_named_material() catches this
-    specifically, ahead of its own broader except Exception.
-    """
-
-
-# function. Each "maps" tuple is (json ddsPaths key, external image node
-# name, required); required maps are read unconditionally -- same as the
-# original, a missing required key raises -- optional maps are only read
-# if present. Node names match SWTOR_SHADER_GROUPS in shaders_menu.py.
-# Each "palettes" tuple is (palette index, include a metallic_specular
-# value too?).
-DERIVED_CONFIGS = {
-    "Creature": {
-        "shader_derived": "CREATURE",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap1", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-            ("directionMap", "directionMap", False),
-        ],
-        "palettes": [],
-        "flesh": True,
-    },
-    "Eye": {
-        "shader_derived": "EYE",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap1", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-        ],
-        # Metallic Specular was never wired up in the old custom node (a
-        # pre-existing bug, confirmed by Crunch, not intentional) -- now
-        # fixed in eye_group(), so read it from json like every other
-        # single-palette derived type.
-        "palettes": [(1, True)],
-        "flesh": False,
-    },
-    "Garment": {
-        "shader_derived": "GARMENT",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap1", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-        ],
-        "palettes": [(1, True), (2, True)],
-        "flesh": False,
-    },
-    "HairC": {
-        "shader_derived": "HAIRC",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap1", True),
-            ("glossMap", "glossMap", True),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-            ("directionMap", "directionMap", True),
-        ],
-        "palettes": [(1, True)],
-        "flesh": False,
-    },
-    "SkinB": {
-        "shader_derived": "SKINB",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("complexionMap", "complexionMap", False),
-            ("rotationMap", "rotationMap1", True),
-            ("facepaintMap", "facepaintMap", False),
-            ("glossMap", "glossMap", True),
-            ("ageMap", "ageMap", False),
-            ("paletteMap", "paletteMap", True),
-            ("paletteMaskMap", "paletteMaskMap", True),
-        ],
-        "palettes": [(1, True)],
-        "flesh": True,
-    },
-    "Uber": {
-        "shader_derived": "UBER",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("rotationMap", "rotationMap1", True),
-            ("glossMap", "glossMap", True),
-        ],
-        "palettes": [],
-        "flesh": False,
-    },
-    "AnimatedUV": {
-        "shader_derived": "ANIMATEDUV",
-        "maps": [
-            ("diffuseMap", "diffuseMap", True),
-            ("animatedTexture1", "animatedTexture1", True),
-            ("animatedTexture2", "animatedTexture2", True),
-            # fresnelGradient exists as a node in the template (unconnected,
-            # per Crunch, ready for when the shader actually uses it) but
-            # deliberately left out of "maps" -- nothing to assign it yet.
-        ],
-        "palettes": [],
-        "flesh": False,
-        # Distinct from every other type: two group nodes, and its
-        # otherValues shape (UV scroll/rotation/tint, not palette/flesh)
-        # doesn't fit _set_palette()'s or the flesh/flush block's shape at
-        # all -- see _set_animated_uv_inputs()'s own docstring.
-        "animated_uv": True,
-    },
-}
-DERIVED_CONFIGS["GarmentScrolling"] = DERIVED_CONFIGS["Garment"]
 
 # The subset of DERIVED_CONFIGS' "maps" json_keys that a real .mat file's
 # own <input> block genuinely defines as the material's baked identity --
-# these are what use_mat_dds_paths overrides from json. Everything else a
+# these are what the use_mat_dds_paths option overrides from json. Everything else a
 # "maps" tuple can list (complexionMap/facepaintMap/ageMap) is per-NPC
 # customization data a .mat file was never meant to represent -- its own
 # baked-in values for those are just generic art/defaultassets/*
@@ -607,230 +173,31 @@ def _apply_mat_dds_overrides(mat_info, mat_path, mat_name):
     return merged
 
 
-def get_or_create_material(resources_root, legacy_resources_root, mat_name, derived, mat_info, object_name=None, missing_assets=None, use_mat_dds_paths=True):
+def _build_npc_material(resources_root, legacy_resources_root, mat_name, derived, mat_info,
+                        object_name, missing_assets, use_mat_dds_paths):
     # type: (str, Optional[str], str, str, Dict[str, Any], Optional[str], Optional[List[Tuple[str, str]]], bool) -> Any
     """
-    Returns a Blender material for the given governing .mat data, (re)
-    building its node graph only if it doesn't already have one.
+    The NPC importer's one entry point to ops/material_builder.py's
+    get_or_create_material(): applies this importer's own policy first --
+    the json+.mat ddsPaths merge when use_mat_dds_paths is on (see
+    _apply_mat_dds_overrides() above for why), and the "is this a head?"
+    decision that gates SkinB's Invert Alpha auto-detect -- then hands the
+    builder finished data.
 
-    mat_name is the .mat file's own basename, extension stripped (spec
-    §6) -- e.g. "hair_twilek_non_a08_v02" -- replacing the original's
-    "{idx} {slotName}{derived}" naming. Lookup is by name, so identical
-    .mat files reused across slots or separate NPC imports collapse into
-    one shared material automatically.
-
-    Dedup is NOT a bare bpy.data.materials.get(mat_name) existence check:
-    import_gr2.py's own low-level .gr2 reader unconditionally creates a
-    default-BSDF placeholder material for every material name embedded
-    *inside* the .gr2 file itself (see its build()'s "NOTE: Create
-    Materials" step) -- entirely independent of this json-driven code.
-    SWTOR .gr2 files can embed a material name that happens to exactly
-    match a real .mat file's basename (confirmed real case:
-    "boot_dancer01_light_ge_a21dancer01_f"), which would collide with
-    our own naming/dedup convention. So existence alone isn't a signal
-    that a material was actually already built by this function -- only
-    the presence of our own SWTOR shader group node is (has_swtor_
-    shader_group(), types/shader_templates.py). If a same-named material
-    exists but wasn't built by us, get_or_build_shader_material() below
-    replaces it in place (every existing user redirected onto the newly
-    built material, then the placeholder deleted) rather than ever
-    creating a second, differently-suffixed material for the same
-    logical .mat.
-
-    object_name is the Blender Object this material is being assigned to
-    (see import_variant()'s call site) -- only used for SkinB's Rotation
-    Map "head" Invert Alpha auto-detect below. Since materials are
-    deduped by name, this only has an effect the first time a given
-    SkinB material is actually built; a shared material re-assigned to a
-    second, differently-named object afterward keeps whatever Invert
-    Alpha value was baked in the first time.
-
-    legacy_resources_root is an optional second resources root (e.g.
-    Crunch's "Legacy Resources Directory" -- same internal layout as a
-    normal resources folder, just a different top-level location), tried
-    as a fallback for EVERY asset this material references individually
-    -- its own .mat file, and each .dds texture -- not a single root
-    decided once from wherever the .mat file happens to resolve. A
-    material's .mat file and its textures live under different resources
-    subtrees (art/shaders/materials/ vs e.g.
-    art/dynamic/player_character/head/texture/), so one resolving under
-    resources_root is no guarantee the other does too (confirmed real
-    case). May be None/falsy if no legacy directory is configured, in
-    which case behavior is unchanged from before legacy support existed.
-
-    missing_assets, if given, is a list this function appends
-    (mat_name, relative_path) onto for every map that's explicitly
-    present in this material's own ddsPaths/required-by-config, but whose
-    file couldn't be found under EITHER root -- soft-fail (the Image
-    Texture node is simply left unassigned, same as an optional map
-    that's absent from json entirely), never raised, so one missing
-    texture never aborts an otherwise-fine import. Callers that want this
-    reported collect it and summarize at the end (see load()); passing
-    None (the default) silently drops this reporting without changing
-    the soft-fail behavior itself.
-
-    use_mat_dds_paths (default True): sources diffuseMap/rotationMap/
-    glossMap/paletteMap/paletteMaskMap/directionMap from the real .mat
-    file's own <input> data instead of json's ddsPaths -- see
-    _apply_mat_dds_overrides()'s docstring. Exists because Jedipedia's
-    NPC json export currently emits stale .dds paths for exactly these
-    keys (confirmed by Crunch); the .mat file's own equivalents are not
-    affected. complexionMap/facepaintMap/ageMap and every otherValues
-    entry (palette/specular/flush/flesh) always come from json regardless
-    of this flag -- a .mat file's own values for those are generic
-    art/defaultassets/* placeholders / non-NPC-specific defaults, never
-    real per-NPC customization data.
+    Note the merge now runs before the builder's own dedup check, so an
+    already-built material costs one extra .mat parse per call. Negligible
+    at NPC scale (a handful of slots), and it keeps the builder free of any
+    json awareness.
     """
-    existing = bpy.data.materials.get(mat_name)
-    if existing is not None and has_swtor_shader_group(existing):
-        return existing
-
-    # "HighQualityCharacter" is an older/alternate name occasionally seen
-    # for what is otherwise a Creature material.
-    derived = "Creature" if derived == "HighQualityCharacter" else derived
-
-    config = DERIVED_CONFIGS.get(derived)
-    if config is None:
-        raise UnrecognizedDerivedTypeError("Unrecognized derived material type: %r" % (derived,))
-
-    other_values = mat_info.get("otherValues", {})
-    dds_paths = mat_info.get("ddsPaths", {})
-
-    # Builds fresh from Atroxa_Shaders.blend (bundled_data/) if no usable
-    # material exists yet under this name -- or, if a same-named material
-    # exists but isn't one of ours (see docstring above), replaces it.
-    # Either way, comes back fully wired (native group + external Image
-    # Texture nodes + reroutes/detours, all pre-built in the template --
-    # see types/shader_templates.py), so there's no node-clearing/
-    # building step needed here anymore.
-    #
-    # Deliberately called BEFORE any .dds image loading below, not after
-    # -- this call may internally orphan-purge (types/shader_templates.py's
-    # _append_template_material(), whenever it has to dedupe a colliding
-    # node group), and that purge is global: it sweeps any currently
-    # zero-real-user datablock in the file, Images included. Holding an
-    # Image reference across this call is unsafe (see migrate_shaders.py's
-    # migrate_material(), which hit exactly this with old_images) -- safe
-    # here only because nothing is loaded yet at this point. If image
-    # loading is ever reordered to happen earlier (e.g. pre-fetched before
-    # the material is built), it would need the same use_fake_user
-    # protection migrate_material() uses.
-    new_mat = get_or_build_shader_material(config["shader_derived"], mat_name)
-    group_node = find_main_shader_group_node(new_mat, config["shader_derived"])
-    image_nodes = {
-        node.name: node for node in new_mat.node_tree.nodes
-        if node.type == 'TEX_IMAGE'
-    }
-
-    # Alpha / transparency: sourced from the real .mat file's own
-    # <AlphaMode>/<AlphaTestValue> (Tier 1, types/mat.py) when it can be
-    # resolved, replacing this function's previous hardcoded CLIP-always
-    # behavior. Jedipedia json data doesn't carry alpha settings at all,
-    # so this is the only source of truth for it -- confirmed with
-    # Crunch. Falls back to the old hardcoded values (CLIP, 0.5) if the
-    # .mat file can't be found/parsed under EITHER resources_root or
-    # legacy_resources_root, so a missing file never blocks an import.
-    #
-    # Deliberately does NOT run Tier 1's skip-list check here -- json
-    # data is always treated as already-correct (confirmed with Crunch),
-    # unlike ops/process_materials.py's materials-by-name entry points,
-    # which do apply it.
-    new_mat.show_transparent_back = False
-    new_mat.surface_render_method = "DITHERED"
-
-    # Only the .mat file's OWN lookup needs root_used specifically (to
-    # know which root to actually read the XML from) -- everything else
-    # below (every .dds lookup) tries BOTH roots per-asset via
-    # _load_or_get_image()/_load_default_map_image(), rather than
-    # assuming a material's textures live under whichever root its .mat
-    # file happened to resolve under. Confirmed real case: a material
-    # whose .mat resolves fine under resources_root, but whose actual
-    # textures (a completely different resources subtree --
-    # player_character/head/texture/ vs the .mat's own
-    # shaders/materials/) only exist under legacy_resources_root.
-    mat_path, _root_used = resolve_resource_path_multi(resources_root, legacy_resources_root, mat_info.get("matPath"))
-    mat_summary = read_mat_summary(mat_path, mat_name) if mat_path is not None else None
-
     if use_mat_dds_paths:
-        # Overrides diffuseMap/rotationMap/glossMap/paletteMap/
-        # paletteMaskMap/directionMap with whatever the real .mat file
-        # says (see _apply_mat_dds_overrides()'s own docstring for why
-        # only these keys, and why <value> not <variable>) -- json
-        # remains the source for complexionMap/facepaintMap/ageMap and
-        # all of otherValues regardless. Off by default's inverse (the
-        # operator-level "Ignore .mat Texture Paths" toggle, see
-        # ImportCHA) exists specifically because Jedipedia's NPC export
-        # currently emits stale .dds paths for the overridden keys.
+        mat_path, _root_used = resolve_resource_path_multi(resources_root, legacy_resources_root, mat_info.get("matPath"))
         mat_info = _apply_mat_dds_overrides(mat_info, mat_path, mat_name)
-        dds_paths = mat_info.get("ddsPaths", {})
 
-    if mat_summary is not None:
-        alpha_blend = mat_summary.alpha_blend
-        alpha_test = mat_summary.alpha_test
-        alpha_test_value = mat_summary.alpha_test_value
-    else:
-        alpha_blend = False
-        alpha_test = True
-        alpha_test_value = 0.5
-
-    new_mat.alpha_threshold = alpha_test_value
-    # Guarded by socket existence, not by shader type: AnimatedUV's own
-    # group (confirmed via real node dump) has no Alpha Blend/Alpha Test/
-    # Alpha Test Value sockets at all -- it's a fixed-blend-mode shader by
-    # design (its "User Controls" panel exposes Roughness/Emission
-    # Strength/Backface Culling instead), so there's nothing to set here.
-    # Checking existence rather than hardcoding "skip for AnimatedUV"
-    # keeps this correct automatically for any future shader type that
-    # also doesn't expose these, without needing another special case.
-    if 'Alpha Blend' in group_node.inputs:
-        group_node.inputs['Alpha Blend'].default_value = alpha_blend
-        group_node.inputs['Alpha Test'].default_value = alpha_test
-        group_node.inputs['Alpha Test Value'].default_value = alpha_test_value
-
-    for json_key, node_name, required in config["maps"]:
-        if required or json_key in dds_paths:
-            relative_path = dds_paths[json_key]
-            image = _load_or_get_image(resources_root, legacy_resources_root, relative_path)
-            if image is None and missing_assets is not None:
-                missing_assets.append((mat_name, relative_path))
-            image_nodes[node_name].image = image
-        else:
-            default_image = _load_default_map_image(resources_root, legacy_resources_root, json_key)
-            if default_image is not None:
-                image_nodes[node_name].image = default_image
-            elif node_name == 'complexionMap':
-                # Last-resort fallback, kept from the original custom
-                # node's behavior: Complexion Color feeds a multiply
-                # against diffuse, so an empty Image Texture node's
-                # black default would render the whole material black
-                # instead of leaving diffuse unchanged. Only reached if
-                # DEFAULT_MAP_ASSETS' own white.dds isn't present under
-                # resources_root either.
-                image_nodes[node_name].image = _get_white_fallback_image()
-
-    # SkinB head materials: auto-detect Invert Alpha from the Rotation
-    # Map's own pixel data, matching the original custom node's behavior.
-    # A one-shot bake at import time rather than a live callback -- see
-    # this function's docstring re: object_name.
-    if derived == "SkinB" and object_name and "head" in object_name.lower():
-        rotation_image = image_nodes['rotationMap1'].image
-        if rotation_image is not None:
-            group_node.inputs['Invert Alpha'].default_value = _is_first_pixel_white(rotation_image)
-
-    # Every derived type feeds "Palette<N> Hue"/"Saturation"/... sockets
-    # (Koda Shaders' convention) -- Garment is the only one with two.
-    for palette_index, include_metallic_specular in config["palettes"]:
-        _set_palette(group_node, other_values, palette_index, include_metallic_specular)
-
-    if config["flesh"]:
-        group_node.inputs['Flesh Brightness'].default_value = float(other_values["fleshBrightness"])
-        flush = other_values["flush"]
-        group_node.inputs['Flush Tone'].default_value = [float(flush[0]), float(flush[1]), float(flush[2]), 1.0]
-
-    if config.get("animated_uv"):
-        _set_animated_uv_inputs(new_mat, group_node, other_values)
-
-    return new_mat
+    return get_or_create_material(
+        resources_root, legacy_resources_root, mat_name, derived, mat_info,
+        missing_assets=missing_assets,
+        detect_skinb_invert_alpha=is_head_object_name(object_name),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -946,7 +313,8 @@ def import_variant(operator, context, resources_root, legacy_resources_root, ent
     fix; the original importer only handled the first).
 
     missing_assets and use_mat_dds_paths are passed straight through to
-    get_or_create_material() -- see its own docstring for both.
+    _build_npc_material() -- see its (and _apply_mat_dds_overrides()'s)
+    docstring.
 
     Returns the list of imported Objects. Empty if entry["models"] is
     empty -- a valid "none" variant (e.g. a bald/clean-shaven option),
@@ -984,9 +352,9 @@ def import_variant(operator, context, resources_root, legacy_resources_root, ent
                     continue
 
                 mat_name = Path(mat_path).stem
-                material = get_or_create_material(
+                material = _build_npc_material(
                     resources_root, legacy_resources_root, mat_name, derived, mat_info,
-                    object_name=ob.name, missing_assets=missing_assets, use_mat_dds_paths=use_mat_dds_paths,
+                    ob.name, missing_assets, use_mat_dds_paths,
                 )
                 ob.material_slots[index].material = material
 
@@ -1544,10 +912,6 @@ def load(operator, context, filepath=""):
     Returns True on success, False on failure (mirrors import_gr2.py's
     own load() return convention).
     """
-    # Deferred import -- see ops/process_materials.py's own module
-    # docstring re: the import_gr2 <-> process_materials <-> import_cha
-    # import cycle; a top-level import here would risk the same cycle.
-    from .process_materials import get_resources_dirs
     resources_root, legacy_resources_root = get_resources_dirs()
 
     if not resources_root or not Path(resources_root).is_dir():
