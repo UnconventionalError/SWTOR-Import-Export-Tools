@@ -505,10 +505,21 @@ def _effective_atlas_layout(name, atlas_mode, material):
     if rows > 1 and cut_y > DYD_ATLAS_CUT_FRACTION * width:
         new_rows = 1
     if (new_columns, new_rows) != (columns, rows):
+        details = []
+        if columns > 1:
+            details.append(
+                "column split %s (%d opaque px on the vertical midline)"
+                % ("dropped" if new_columns != columns else "kept", cut_x)
+            )
+        if rows > 1:
+            details.append(
+                "row split %s (%d opaque px on the horizontal midline)"
+                % ("dropped" if new_rows != rows else "kept", cut_y)
+            )
         print(
-            "dyd card %r: data says %dx%d but sprites cross the cell boundaries (%d / %d opaque px on the "
-            "vertical / horizontal lines) -> using %dx%d (DYD_AUTO_FIX_ATLAS_LAYOUT = False follows the data)"
-            % (name, columns, rows, cut_x, cut_y, new_columns, new_rows)
+            "dyd card %r: layout auto-corrected %dx%d -> %dx%d: %s. "
+            "Set DYD_AUTO_FIX_ATLAS_LAYOUT = False to follow the data."
+            % (name, columns, rows, new_columns, new_rows, ", ".join(details))
         )
     return new_columns, new_rows
 
@@ -1330,7 +1341,16 @@ def add_dyd_scatter(obj, heightmap, area, resources_root_check=True, viewport_de
 
             params = area.dyd_placement_params(channel_id)
             if params is None:
-                print("dyd channel %d (%r): no type-0 placement params, skipping" % (channel_id, asset_name))
+                # Say WHY: a channel id can carry records of several types (type 2 = a colour int,
+                # type 3 = a preset), and only type 0 holds placement data.
+                record_types = sorted({c.type for c in area.dyd_channels if c.id == channel_id})
+                if record_types:
+                    print(
+                        "dyd channel %d (%r): no type-0 placement record (only type %s in area.dat), skipping"
+                        % (channel_id, asset_name, "/".join(str(t) for t in record_types))
+                    )
+                else:
+                    print("dyd channel %d (%r): no channel record in area.dat, skipping" % (channel_id, asset_name))
                 continue
 
             is_mesh = area.is_dyd_mesh_channel(channel_id)
