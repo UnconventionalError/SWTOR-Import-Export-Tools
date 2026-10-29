@@ -211,20 +211,26 @@ class AreaDat(object):
         self.dyd_textures = dyd_textures
         self.dyd_channels = dyd_channels
 
-    def dyd_channel(self, channel_id):
-        # type: (int) -> Optional[AreaDatDydChannel]
+    def dyd_channel(self, channel_id, channel_type=None):
+        # type: (int, Optional[int]) -> Optional[AreaDatDydChannel]
         """Resolves a types.hms.Heightmap.dyd_channels channelId (1-31
-        billboard, 32-63 mesh) to its display parameters."""
+        billboard, 32-63 mesh) to its display parameters.
+
+        A channelId can have SEVERAL records of different types (e.g. a
+        type 2 colour record and a type 0 placement record under the same
+        id, in either order -- seen on Korriban, Onderon and Dantooine
+        areas). With `channel_type` given, only a record of that type
+        matches; without it the first record with the id is returned."""
         for channel in self.dyd_channels:
-            if channel.id == channel_id:
+            if channel.id == channel_id and (channel_type is None or channel.type == channel_type):
                 return channel
         return None
 
     def dyd_placement_params(self, channel_id):
         # type: (int) -> Optional[DydPlacementParams]
         """Resolves a channelId straight to its decoded type-0 params, or
-        None if there's no channel for this id or it isn't type 0."""
-        channel = self.dyd_channel(channel_id)
+        None if this id has no type-0 record."""
+        channel = self.dyd_channel(channel_id, 0)
         return DydPlacementParams.from_channel(channel) if channel is not None else None
 
     def dyd_asset_name(self, channel_id):
