@@ -40,7 +40,7 @@ from typing import List, NamedTuple
 import bpy
 
 from ..types.node_deprecated import CREATURE, EYE, GARMENT, HAIRC, SKINB, UBER
-from ..types.shader_templates import find_main_shader_group_node, get_or_build_shader_material
+from ..types.shader_templates import ShaderTemplateError, find_main_shader_group_node, get_or_build_shader_material
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +277,13 @@ def _find_hero_node(material):
     return None
 
 
+# Throwaway name the replacement material is built under while it's being
+# validated and filled in -- see migrate_material(). Only ever exists for
+# the duration of one call (removed again on failure, renamed to the
+# original's name on success).
+_SCRATCH_MATERIAL_NAME = "__swtor_migrate_scratch__"
+
+
 class MigrationResult(NamedTuple):
     """
     Return value of migrate_material() -- richer than a plain bool so
@@ -308,6 +315,12 @@ def migrate_material(material):
     material (old_node and its private node_tree included) deleted, new
     one renamed to take over the original name.
 
+    The replacement is built and fully populated under a scratch name
+    FIRST; the original is only touched (users remapped, deleted) once
+    that has succeeded. Any failure before that point removes the
+    scratch material and leaves the original exactly as it was, and
+    re-raises.
+
     Real per-material values that only exist on the old node -- assigned
     images, alpha mode, palette settings, flesh/flush -- are read off
     BEFORE replacement and written onto the new material's equivalent
@@ -324,16 +337,21 @@ def migrate_material(material):
     if old_node is None:
         return _NO_OP_RESULT
 
-    config = MIGRATE_CONFIGS.get(old_node.derived)
-    if config is None:
-        raise ValueError(f"Unrecognized ShaderNodeHeroEngine.derived value: {old_node.derived!r}")
+    # Read ONCE, up front, into a local. old_node lives inside `material`,
+    # which is deleted at the end of this function -- after that point
+    # old_node is a freed node, and reading any property off it returns
+    # that property's default (for `derived`, 'CREATURE') rather than
+    # raising. Everything below uses this local, never old_node.derived.
+    derived = old_node.derived
 
-    # Everything below reads off `material`/`old_node` -- must happen
-    # BEFORE get_or_build_shader_material() replaces the material,
-    # which deletes this exact datablock outright (see its own
-    # docstring). Nothing past that call may touch `material` or
-    # `old_node` again; both become stale references the moment it
-    # returns.
+    config = MIGRATE_CONFIGS.get(derived)
+    if config is None:
+        raise ValueError(f"Unrecognized ShaderNodeHeroEngine.derived value: {derived!r}")
+
+    # Everything in this block reads off `material`/`old_node`. Nothing
+    # after the final swap at the bottom of this function may touch
+    # `material` or `old_node` again; both become stale references the
+    # moment the old material is removed.
     old_images = {}
     missing_assets = []
     for attr_name, node_name in config["image_maps"]:
@@ -352,14 +370,21 @@ def migrate_material(material):
     # datablock in the file, not just the duplicate it's actually after.
     # Holding a Python reference to an Image here doesn't protect it --
     # if its only real Blender-tracked user was old_node's own internal
-    # per-instance node tree (about to be deleted), it can already be at
-    # zero real users the moment we read it above, making it exactly as
-    # vulnerable as an unassigned material was earlier in this project.
-    # Fake-user each one for the duration; cleared again once each is
-    # reassigned onto the new material's image nodes below, where it
-    # picks up a real user again.
+    # per-instance node tree, it can already be at zero real users the
+    # moment we read it above, making it exactly as vulnerable as an
+    # unassigned material was earlier in this project.
+    # Fake-user each one for the duration; each image's PRIOR
+    # use_fake_user state is restored once it's safely assigned onto the
+    # new material (or the whole operation is rolled back).
+    images_fake_user_before = [(image, image.use_fake_user) for image in old_images.values()]
     for image in old_images.values():
         image.use_fake_user = True
+
+    # The original material gets the same protection: it may have zero
+    # real users (e.g. unassigned) and that purge would otherwise delete
+    # it out from under us before the swap.
+    material_fake_user_before = material.use_fake_user
+    material.use_fake_user = True
 
     # alpha_mode/alpha_test_value/alpha_invert are the real, correct
     # values for this specific material -- read and preserve them
@@ -382,8 +407,8 @@ def migrate_material(material):
             # bpy_prop_array, a live view into old_node's own RNA memory,
             # NOT an independent copy the way a plain FloatProperty read
             # is. tuple() forces an eager copy now, before old_node (and
-            # the material it belongs to) gets deleted a few lines down
-            # -- otherwise this reference goes stale in between and
+            # the material it belongs to) gets deleted at the end --
+            # otherwise this reference goes stale in between and
             # silently reads back garbage/zeroed data at the point of
             # use, rather than raising.
             "specular": tuple(getattr(old_node, f"{prefix}_specular")),
@@ -394,44 +419,68 @@ def migrate_material(material):
     flesh_brightness = old_node.flesh_brightness if config["flesh"] else None
     flush_tone = tuple(old_node.flush_tone) if config["flesh"] else None
 
-    # Replace the whole material. force=True: this is a deliberate
-    # "convert this material now" action, not an idempotent build-once
-    # import call -- must replace even if (unexpectedly) something
-    # already-native already existed under this name.
+    # Build and populate the replacement under a scratch name, leaving
+    # the original completely untouched. force=True: the scratch name is
+    # ours alone, but a stale one left behind by some earlier crash must
+    # be replaced rather than reused.
     original_name = material.name
-    new_mat = get_or_build_shader_material(old_node.derived, original_name, force=True)
-    group_node = find_main_shader_group_node(new_mat, old_node.derived)
-    image_nodes = {
-        node.name: node for node in new_mat.node_tree.nodes
-        if node.type == 'TEX_IMAGE'
-    }
+    new_mat = None
+    try:
+        new_mat = get_or_build_shader_material(derived, _SCRATCH_MATERIAL_NAME, force=True)
+        group_node = find_main_shader_group_node(new_mat, derived)
+        image_nodes = {
+            node.name: node for node in new_mat.node_tree.nodes
+            if node.type == 'TEX_IMAGE'
+        }
 
-    # Images -- already-loaded bpy.data.images datablocks, reassign
-    # directly onto the new external Image Texture nodes, no reload.
-    for node_name, image in old_images.items():
-        image_nodes[node_name].image = image
-        image.use_fake_user = False
+        # Images -- already-loaded bpy.data.images datablocks, reassign
+        # directly onto the new external Image Texture nodes, no reload.
+        for node_name, image in old_images.items():
+            if node_name not in image_nodes:
+                raise ShaderTemplateError(
+                    f"Template material for {derived!r} has no Image Texture node named "
+                    f"'{node_name}' (migrating '{original_name}')."
+                )
+            image_nodes[node_name].image = image
 
-    group_node.inputs['Alpha Blend'].default_value = alpha_blend
-    group_node.inputs['Alpha Test'].default_value = alpha_test
-    group_node.inputs['Alpha Test Value'].default_value = alpha_test_value
-    group_node.inputs['Invert Alpha'].default_value = alpha_invert
+        group_node.inputs['Alpha Blend'].default_value = alpha_blend
+        group_node.inputs['Alpha Test'].default_value = alpha_test
+        group_node.inputs['Alpha Test Value'].default_value = alpha_test_value
+        group_node.inputs['Invert Alpha'].default_value = alpha_invert
 
-    # Palettes
-    for index, values in palette_values.items():
-        socket_prefix = f"Palette{index} "
-        group_node.inputs[f'{socket_prefix}Hue'].default_value = values["hue"]
-        group_node.inputs[f'{socket_prefix}Saturation'].default_value = values["saturation"]
-        group_node.inputs[f'{socket_prefix}Brightness'].default_value = values["brightness"]
-        group_node.inputs[f'{socket_prefix}Contrast'].default_value = values["contrast"]
-        group_node.inputs[f'{socket_prefix}Specular'].default_value = values["specular"]
-        if "metallic_specular" in values:
-            group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = values["metallic_specular"]
+        # Palettes
+        for index, values in palette_values.items():
+            socket_prefix = f"Palette{index} "
+            group_node.inputs[f'{socket_prefix}Hue'].default_value = values["hue"]
+            group_node.inputs[f'{socket_prefix}Saturation'].default_value = values["saturation"]
+            group_node.inputs[f'{socket_prefix}Brightness'].default_value = values["brightness"]
+            group_node.inputs[f'{socket_prefix}Contrast'].default_value = values["contrast"]
+            group_node.inputs[f'{socket_prefix}Specular'].default_value = values["specular"]
+            if "metallic_specular" in values:
+                group_node.inputs[f'{socket_prefix}Metallic Specular'].default_value = values["metallic_specular"]
 
-    # Flesh / Flush
-    if config["flesh"]:
-        group_node.inputs['Flesh Brightness'].default_value = flesh_brightness
-        group_node.inputs['Flush Tone'].default_value = flush_tone
+        # Flesh / Flush
+        if config["flesh"]:
+            group_node.inputs['Flesh Brightness'].default_value = flesh_brightness
+            group_node.inputs['Flush Tone'].default_value = flush_tone
+    except Exception:
+        # Roll back: the original was never modified, so just discard the
+        # scratch material and undo the temporary fake users.
+        if new_mat is not None:
+            bpy.data.materials.remove(new_mat)
+        material.use_fake_user = material_fake_user_before
+        for image, fake_user_before in images_fake_user_before:
+            image.use_fake_user = fake_user_before
+        raise
+
+    # Success -- only now replace the original. After the remove() below,
+    # `material` and `old_node` are stale and must not be touched again.
+    material.user_remap(new_mat)
+    bpy.data.materials.remove(material)
+    new_mat.name = original_name
+    new_mat.use_fake_user = material_fake_user_before
+    for image, fake_user_before in images_fake_user_before:
+        image.use_fake_user = fake_user_before
 
     return MigrationResult(converted=True, missing_assets=missing_assets)
 
