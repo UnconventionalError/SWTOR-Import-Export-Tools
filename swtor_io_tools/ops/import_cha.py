@@ -173,6 +173,34 @@ def _apply_mat_dds_overrides(mat_info, mat_path, mat_name):
     return merged
 
 
+def _material_roots(operator, resources_root, legacy_resources_root):
+    # type: (Any, str, Optional[str]) -> Tuple[Optional[str], Optional[str]]
+    """
+    Returns the (first, second) root pair used for MATERIAL lookups only
+    (.mat merge, .mat alpha read, .dds textures, default-map fallbacks).
+
+    With the operator's `prefer_legacy_materials` on AND a valid Legacy
+    Resources Directory, the pair is swapped so Legacy is tried first and the
+    regular root is the per-asset fallback. Otherwise the pair is returned
+    unchanged.
+
+    The directory-validity guard is required, not cosmetic: swapping with no
+    Legacy directory would make the first root None, and when nothing resolves,
+    resolve_resource_path_multi() falls back to
+    resolve_resource_path(first_root, ...), which raises TypeError on
+    Path(None).
+
+    Never use this for models or skeletons: those stay on `resources_root`.
+    """
+    if (
+        getattr(operator, "prefer_legacy_materials", False)
+        and legacy_resources_root
+        and Path(legacy_resources_root).is_dir()
+    ):
+        return legacy_resources_root, resources_root
+    return resources_root, legacy_resources_root
+
+
 def _build_npc_material(resources_root, legacy_resources_root, mat_name, derived, mat_info,
                         object_name, missing_assets, use_mat_dds_paths):
     # type: (str, Optional[str], str, str, Dict[str, Any], Optional[str], Optional[List[Tuple[str, str]]], bool) -> Any
@@ -316,11 +344,21 @@ def import_variant(operator, context, resources_root, legacy_resources_root, ent
     _build_npc_material() -- see its (and _apply_mat_dds_overrides()'s)
     docstring.
 
+    Models always resolve against `resources_root`. Materials use the root
+    pair from _material_roots(), which the operator's `prefer_legacy_materials`
+    may swap (Legacy first) -- the swap is deliberately confined to the
+    material lookups so models/skeletons never leave the primary tree.
+
     Returns the list of imported Objects. Empty if entry["models"] is
     empty -- a valid "none" variant (e.g. a bald/clean-shaven option),
     not an error.
     """
     imported_objects = []
+
+    # Root pair for materials only; computed once per variant, not per slot.
+    # `resources_root` itself is left untouched: models below always resolve
+    # against it (see _material_roots() / prefer_legacy_materials).
+    mat_primary, mat_secondary = _material_roots(operator, resources_root, legacy_resources_root)
 
     for model_path in entry.get("models", []):
         resolved_path = resolve_resource_path(resources_root, model_path)
@@ -353,7 +391,7 @@ def import_variant(operator, context, resources_root, legacy_resources_root, ent
 
                 mat_name = Path(mat_path).stem
                 material = _build_npc_material(
-                    resources_root, legacy_resources_root, mat_name, derived, mat_info,
+                    mat_primary, mat_secondary, mat_name, derived, mat_info,
                     ob.name, missing_assets, use_mat_dds_paths,
                 )
                 ob.material_slots[index].material = material
@@ -921,6 +959,18 @@ def load(operator, context, filepath=""):
         )
         return False
 
+    # The switch is silently ignored by _material_roots() when the Legacy
+    # directory is unusable; say so once rather than leaving it easy to miss.
+    if (
+        getattr(operator, "prefer_legacy_materials", False)
+        and not (legacy_resources_root and Path(legacy_resources_root).is_dir())
+    ):
+        operator.report(
+            {'WARNING'},
+            "Prefer Legacy Materials is on, but no valid Legacy Resources Directory "
+            "is set in the add-on preferences -- ignored, using the Resources Directory only.",
+        )
+
     try:
         meta, slots, skin_mats = read(filepath)
     except (OSError, json.JSONDecodeError) as exc:
@@ -1060,6 +1110,25 @@ class ImportCHA(bpy.types.Operator):
             "that's fixed to go back to reading them straight from json.\n\n"
             "Complexion/Facepaint/Age maps and all hue/palette values "
             "always come from json regardless of this setting."
+        ),
+        default=False,
+    )
+
+    # Opt-in: resolve materials (.mat files and .dds textures) from the Legacy
+    # Resources Directory first, with the regular Resources Directory as the
+    # per-asset fallback. Models and skeletons are never affected. Default False
+    # so existing users/callers see no change. A preference-seeded default is
+    # deliberately NOT used: programmatic calls
+    # (bpy.ops.import_mesh.gr2_json(filepath=..., prefer_legacy_materials=True))
+    # skip invoke(), so a preference would never reach them.
+    prefer_legacy_materials: bpy.props.BoolProperty(
+        name="Prefer Legacy Materials",
+        description=(
+            "Resolves materials (.mat files and textures) from the Legacy "
+            "Resources Directory first, falling back to the Resources "
+            "Directory for anything missing. Models and skeletons are "
+            "unaffected.\n\nRequires a valid Legacy Resources Directory in "
+            "the add-on preferences; ignored otherwise."
         ),
         default=False,
     )
