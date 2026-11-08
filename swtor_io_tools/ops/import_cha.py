@@ -580,7 +580,7 @@ def assemble_collections(context, npc_name, slot_objects, skeleton_ob=None, char
     NPC root Collection itself, since that's already named from npc_name.
 
     Every Collection is created fresh via bpy.data.collections.new()
-    rather than looked up/reused by name -- seebpy.data.collections is a
+    rather than looked up/reused by name -- see bpy.data.collections is a
     global namespace, not scoped by nesting; reusing an existing
     same-named Collection across two different NPC imports in the same
     file would merge their objects together, which is never wanted here.
