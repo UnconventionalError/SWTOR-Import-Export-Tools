@@ -1198,6 +1198,29 @@ class ImportCHA(bpy.types.Operator):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
 
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        header, body = layout.panel("SWTOR_IO_CHA_options", default_closed=False)
+        header.label(text="Import Options")
+        if body:
+            body.prop(self, "append_character_name_to_collections")
+            body.prop(self, "npc_uses_skin")
+            body.prop(self, "ignore_mat_dds_paths")
+            body.prop(self, "prefer_legacy_materials")
+            body.prop(self, "correct_twilek_eyes_uv")
+
+        header, body = layout.panel("SWTOR_IO_CHA_rigging", default_closed=False)
+        header.label(text="Rigging")
+        if body:
+            body.prop(self, "import_skeleton")
+            body.prop(self, "bind_to_skeleton")
+            body.prop(self, "separate_eyes")
+            body.prop(self, "separate_each_eye")
+
+
     def execute(self, context):
         if load(self, context, filepath=self.filepath):
             return {'FINISHED'}

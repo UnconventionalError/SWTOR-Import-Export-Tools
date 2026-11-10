@@ -54,12 +54,6 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
-    gr2_blender_friendly_skeleton: bpy.props.BoolProperty(
-        name="Blender Friendly Skeleton",
-        description="SKELETON (.gr2) FILES ONLY. Default state of the 'Blender Friendly Skeleton'\noption: normalizes bone roll across the whole skeleton (instead of BioWare's\noriginal, often arbitrary-looking per-bone values), which also fixes X-Mirror\nediting.\n\nWill not work with .jba animations.\n\nDoes not move, resize or reshape any bone.\n\nCan still be switched per-import in the importer's own panel",
-        default=False,
-    )
-
     gr2_apply_materials_by_name_default: bpy.props.BoolProperty(
         name="Apply Materials By Name By Default",
         description="Default state of the .gr2 importer's 'Apply Materials By Name' option: after\nimport, looks up each material's name against a real .mat file in the Resources\nDirectory (or Legacy Resources Directory) and builds its native SWTOR shader\nautomatically. Materials with no matching .mat file are left alone, no error.\n\nOnly affects direct .gr2 imports -- the NPC/Character (.json) importer always\nsources its own material data from the json file instead.\n\nCan still be switched per-import in the importer's own panel",
@@ -116,6 +110,18 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    jba_import_as_nla: bpy.props.BoolProperty(
+        name="Import as NLA Track",
+        description="Imports every animation into its own NLA track instead of replacing the\narmature's active action (any active action is kept, pushed down into an\nNLA track first). Additive animations (e.g. 'ad_' facial expressions) are\nlayered on top of the others with 'Combine' blending.\n\nOff: every animation is imported as plain keyframes in the active action",
+        default=True,
+    )
+
+    jba_repair_broken_frames: bpy.props.BoolProperty(
+        name="Repair Broken Frames",
+        description="Some SWTOR animations have single frames where a shoulder or hip spins a\nfull 360° between two frames (an error in the game's own data), twisting\nthe limb into a broken pose for that one frame. This finds those frames and\nreplaces the affected bones' rotations with the halfway point between the\nframes either side. Every other bone and frame is left exactly as stored, and\nthe repaired frames are listed after importing. Additive animations are never\nchanged.\n\nOff: the animation is imported exactly as stored",
+        default=False,
+    )
+
     # UI ----------------------------------------
     
     def draw(self, context):        
@@ -146,7 +152,6 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'gr2_import_collision')
         boxcol.prop(self,'gr2_name_as_filename', text="Name Imported Objects As Filenames")
         boxcol.prop(self,'gr2_apply_axis_conversion', text="'Apply' Axis Conversion")
-        boxcol.prop(self,'gr2_blender_friendly_skeleton', text="Blender Friendly Skeleton")
         boxcol.prop(self,'gr2_apply_materials_by_name_default', text="Apply Materials By Name")
         boxcol.prop(self,'gr2_scale_object', text="Scale Imported Objects/Characters")
         slider_split = boxcol.split(factor=0.1)
@@ -159,6 +164,8 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.scale_y = 0.90
         boxcol.prop(self,'jba_ignore_facial_bones', text="Ignore Facial Bones' Translation Data")
         boxcol.prop(self,'jba_delete_180')
+        boxcol.prop(self,'jba_import_as_nla')
+        boxcol.prop(self,'jba_repair_broken_frames')
         boxcol.label()
         boxcol.label(text="The Animation and Character Importers")
         boxcol.label(text="use all the applicable .gr2 Object settings.")
