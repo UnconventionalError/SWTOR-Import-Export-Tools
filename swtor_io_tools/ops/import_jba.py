@@ -109,21 +109,10 @@ frames.
 RIG DATA
 The .gr2 importer stores each skeleton's character specification on its
 armature (types/spec.py: art/dynamic/spec/*.dyc/.dat/.mag): its animation
-folder, action list and resources root. They're used here to find the rig's
+folder and resources root. They're used here to find the rig's
 networks and .amx files (instead of guessing them from the armature's name,
 which is still the fallback for armatures imported before), and the
 skeletons for SOURCE SKELETON even when the .jba was copied elsewhere.
-
-ACTION LIST (import option 'Loop Looping Animations', on by default; 'Masked Bones Only', off by default)
-The rig's action list (anim/<category>/am_*.xml, types/aam.py) says how the
-game plays each animation: whether it loops, its blend in/out times, and the
-bone mask it plays on when layered over the legs' movement (or full body).
-All of it is stored on the action as swtor_* custom properties. Looping
-animations get a cyclic action (Cycles modifiers, cyclic frame range). Blend
-times are not applied to NLA strips: a strip that blends in fades from the
-rest pose when nothing plays below it. With Masked Bones Only, an animation
-with a mask keys only the mask's bones (the armature's 'Mask: ...' bone
-collection, from its .dyc), so it can be layered over locomotion.
 
 ADDITIVE ANIMATIONS
 Some .jba files (in bmnnew, the 1060 'ad_' ones: facial expressions, aim and
@@ -201,7 +190,6 @@ from mathutils import Matrix, Quaternion, Vector
 
 from ..types.jba import JBAError, JointBoneAnimation, read_jba
 from ..types.mph import BONES_FROM_DATA, BONES_FROM_LIBRARY, BONES_INFERRED, MPH_ANIM_LIBRARY_FILE, find_bone_name_candidates
-from ..types.aam import ActionList, read_action_list
 from ..types.amx import folder_sources
 from ..types.spec import find_character_spec, spec_folders_for
 from ..utils.string import path_split
@@ -306,7 +294,7 @@ class ImportJBA(Operator):
     ignore_facial_bones: BoolProperty(
         name="Ignore Face Bones",
         description="Ignores the data in the facial bones' translation keyframes\nand only uses their rotation keyframes.\n\nAbsolute animations only: in additive ones, facial translations\nare part of the expression (e.g. raised brows)",
-        default=True,
+        default=False,
     )
 
     delete_180: BoolProperty(
@@ -333,33 +321,6 @@ class ImportJBA(Operator):
         default=True,
     )
 
-    cyclic_loops: BoolProperty(
-        name="Loop Looping Animations",
-        description="Animations the game plays as loops (its action list's 'ambient' ones, e.g. idles)\nget a cyclic action: Cycles modifiers on their F-curves and a cyclic\nframe range, so they repeat when played past their end.\n\nThe game's blend times and bone mask are stored on every action\n(swtor_* custom properties) either way.\n\nOff: looping animations play once, like the others",
-        default=True,
-    )
-
-    masked_bones_only: BoolProperty(
-        name="Masked Bones Only",
-        description="For animations the game plays on part of the body (its action list gives them a\nbone mask, e.g. 'upperbody', so they can play over the legs' walk), keys only\nthe mask's bones (the armature's 'Mask: ...' bone collection), so the action\ncan be layered over a locomotion action in the NLA. Masked imports are named as\nsuch: 'em_wave_[masked_upperbody]'.\n\nThis leaves out the clip's other bones.\n\nOff: every bone in the clip is keyed",
-        default=False,
-    )
-
-    set_scene_fps: BoolProperty(
-        name="Set Scene FPS to 30",
-        description="Sets the scene's frame rate to 30 fps.\n\nThe keyframes are placed at their real time in the scene's frame rate either way. "
-                    "SWTOR animations are nearly all 15 or 30 fps, so at 30 fps their keyframes land on whole frames (a 15 fps "
-                    "animation on every second one), while other rates, such as Blender's default of 24 fps, put them "
-                    "between frames.\n\nThis changes the whole scene, including cloth simulations",
-        default=False,
-    )
-
-    set_frame_range: BoolProperty(
-        name="Set Frame Range to Animation",
-        description="Sets the scene's Start and End frames to the animation's length",
-        default=False,
-    )
-
     scale_animation: BoolProperty(
         name="Scale Animation",
         description="Scales the bones' translation data by a factor.\nIt must match the scale of the skeleton\nand objects to be animated for good results.\n\nWhenever possible, this setting will try to match\nthe Objects' Scale Factor automatically.\nIt will still allow for setting different values manually",
@@ -384,8 +345,6 @@ class ImportJBA(Operator):
         self.import_as_nla = prefs.jba_import_as_nla
         self.repair_broken_frames = prefs.jba_repair_broken_frames
         self.fit_to_armature = prefs.jba_fit_to_armature
-        self.cyclic_loops = prefs.jba_cyclic_loops
-        self.masked_bones_only = prefs.jba_masked_bones_only
         self.scale_animation = prefs.gr2_scale_object
         self.scale_factor = prefs.gr2_scale_factor
 
@@ -411,10 +370,6 @@ class ImportJBA(Operator):
             body.prop(self, "import_as_nla")
             body.prop(self, "repair_broken_frames")
             body.prop(self, "fit_to_armature")
-            body.prop(self, "cyclic_loops")
-            body.prop(self, "masked_bones_only")
-            body.prop(self, "set_scene_fps")
-            body.prop(self, "set_frame_range")
 
         # Rarely needed, so a collapsible sub-panel that starts collapsed.
         # body is None while the sub-panel is collapsed.
@@ -504,47 +459,6 @@ def _armature_rig_folder(context, ob):
             if os.path.isdir(folder):
                 return folder
     return None
-
-
-def _action_list(context, filepath, ob):
-    # type: (Context, str, Object) -> Optional[ActionList]
-    """
-    The game's action list for the armature's rig (types/aam.py): the one its
-    character specification names, else the am_<category>.xml in the
-    category folder of the armature's rig or of the .jba (anim/humanoid/
-    am_humanoid.xml), else None.
-    """
-    metadata = _armature_rig_info(context, ob)[1]
-    if metadata:
-        return read_action_list(metadata)
-    folders = []
-    rig_folder = _armature_rig_folder(context, ob)
-    if rig_folder:
-        folders.append(os.path.dirname(rig_folder))
-    folders.append(os.path.dirname(os.path.dirname(os.path.abspath(filepath))))
-    for category in folders:
-        path = os.path.join(category, f"am_{os.path.basename(category)}.xml")
-        if os.path.isfile(path):
-            return read_action_list(path)
-    return None
-
-
-def _mask_bones(context, ob, mask_name):
-    # type: (Context, Object, str) -> Optional[Set[str]]
-    """The bones of one of the rig's bone masks: its 'Mask: <name>' bone collection, else its character specification's."""
-    from .import_gr2_armature import MASK_COLLECTION_PREFIX
-    collection = ob.data.collections.get(MASK_COLLECTION_PREFIX + mask_name)
-    if collection is not None:
-        return {bone.name for bone in collection.bones}
-    prefs = _prefs(context)
-    skeleton = _skeleton_file_name(ob)
-    roots = [r for r in (ob.get("swtor_resources_root"), prefs.swtor_resources_dir) if r]
-    try:
-        spec = find_character_spec(skeleton, spec_folders_for("", roots))
-    except OSError:
-        spec = None
-    weights = spec.masks.get(mask_name) if spec else None
-    return {name for name, weight in weights.items() if weight > 0} if weights else None
 
 
 # ---------------------------------------------------------------------------
@@ -1539,6 +1453,27 @@ def _new_key_types(context):
             props["handle_left_type"].enum_items[edit.keyframe_new_handle_type].value)
 
 
+def _fcurve_ensure(action, ob, data_path, index, group_name):
+    # type: (bpy.types.Action, Object, str, int, str) -> bpy.types.FCurve
+    """
+    The action's F-curve for data_path[index] on ob's slot, created if needed,
+    in the group_name group. Blender 5.0+ takes the group in
+    fcurve_ensure_for_datablock() itself; 4.4/4.5 don't, so the F-curve is
+    created first and then put into the group of the slot's channelbag.
+    """
+    try:
+        return action.fcurve_ensure_for_datablock(ob, data_path, index=index, group_name=group_name)
+    except TypeError:
+        pass
+    fcurve = action.fcurve_ensure_for_datablock(ob, data_path, index=index)
+    if fcurve.group is None or fcurve.group.name != group_name:
+        from bpy_extras.anim_utils import action_get_channelbag_for_slot
+        channelbag = action_get_channelbag_for_slot(action, ob.animation_data.action_slot)
+        group = channelbag.groups.get(group_name) or channelbag.groups.new(group_name)
+        fcurve.group = group
+    return fcurve
+
+
 def _key_channels(action, ob, key_types, data_path, group_name, frames, values):
     # type: (bpy.types.Action, Object, Tuple[int, int], str, str, List[float], List[Sequence[float]]) -> None
     """
@@ -1553,7 +1488,7 @@ def _key_channels(action, ob, key_types, data_path, group_name, frames, values):
     if not num:
         return
     for index in range(len(values[0])):
-        fcurve = action.fcurve_ensure_for_datablock(ob, data_path, index=index, group_name=group_name)
+        fcurve = _fcurve_ensure(action, ob, data_path, index, group_name)
         points = fcurve.keyframe_points
         if len(points):  # not expected on a new action: keep keyframe_insert()'s replace-on-same-frame behaviour
             for frame, value in zip(frames, values):
@@ -1649,62 +1584,6 @@ def _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, fra
 
 
 # ---------------------------------------------------------------------------
-# The game's action list (see top of file: ACTION LIST)
-# ---------------------------------------------------------------------------
-
-def _action_fcurves(action):
-    # type: (bpy.types.Action) -> list
-    """Every F-curve of an action, for both slotted (Blender 4.4+) and legacy actions."""
-    fcurves = []
-    for layer in getattr(action, "layers", []):
-        for strip in layer.strips:
-            for channelbag in getattr(strip, "channelbags", []):
-                fcurves.extend(channelbag.fcurves)
-    if not fcurves and hasattr(action, "fcurves"):
-        fcurves = list(action.fcurves)
-    return fcurves
-
-
-def _apply_action_info(operator, action, info, mask_name, frames, anim_name):
-    # type: (Operator, bpy.types.Action, object, Optional[str], List[float], str) -> None
-    """
-    Stores what the game's action list says about the animation on the action
-    ('swtor_loops', 'swtor_blend_in', 'swtor_blend_out' in seconds,
-    'swtor_full_body', 'swtor_mask'), and, with Loop Looping Animations on,
-    makes looping ones cyclic: a cyclic manual frame range over the keys, and
-    a Cycles modifier on every F-curve.
-    """
-    action["swtor_loops"] = info.loops
-    action["swtor_full_body"] = info.full_body
-    if info.blend_in is not None:
-        action["swtor_blend_in"] = info.blend_in
-    if info.blend_out is not None:
-        action["swtor_blend_out"] = info.blend_out
-    if mask_name:
-        action["swtor_mask"] = mask_name
-
-    details = []
-    if info.loops and getattr(operator, "cyclic_loops", True) and len(frames) > 1:
-        action.use_frame_range = True
-        action.frame_start = frames[0]
-        action.frame_end = frames[-1]
-        action.use_cyclic = True
-        for fcurve in _action_fcurves(action):
-            if not any(modifier.type == 'CYCLES' for modifier in fcurve.modifiers):
-                fcurve.modifiers.new('CYCLES')
-        details.append("loops in the game, made cyclic")
-    elif info.loops:
-        details.append("loops in the game")
-    if info.blend_in is not None or info.blend_out is not None:
-        blend_in = f"{info.blend_in:g} s" if info.blend_in is not None else "default"
-        blend_out = f"{info.blend_out:g} s" if info.blend_out is not None else "default"
-        details.append(f"blends in over {blend_in} and out over {blend_out}")
-    details.append("plays on the whole body" if not mask_name else f"plays on the '{mask_name}' bone mask when layered")
-    operator.report({'INFO'}, f"'{anim_name}': per the game's action list, " + "; ".join(details) +
-                              " (stored on the action as swtor_* properties).")
-
-
-# ---------------------------------------------------------------------------
 # Building the animation
 # ---------------------------------------------------------------------------
 
@@ -1736,20 +1615,6 @@ def _repair(operator, jba, ob, morpheme_space, morpheme_space_inv, frames_per_sa
             details.append(f"frame {round(frame, 2):g} ({', '.join(repaired[s])})")
         operator.report({'INFO'}, f"'{anim_name}': repaired {len(repaired)} broken "
                                   f"frame{'s' if len(repaired) > 1 else ''}: " + "; ".join(details))
-
-
-def _masked_bones(operator, context, ob, mask_name, animated_bones, anim_name):
-    # type: (Operator, Context, Object, str, list, str) -> Optional[Set[str]]
-    """Masked Bones Only (see top of file: ACTION LIST): the bones to key, or None to key them all."""
-    mask_bones = _mask_bones(context, ob, mask_name)
-    if mask_bones:
-        keyed = sum(1 for b in animated_bones if b.name in mask_bones)
-        operator.report({'INFO'}, f"'{anim_name}': the game plays it on its '{mask_name}' bone mask; only those "
-                                  f"{keyed} bones were keyed (Masked Bones Only).")
-    else:
-        operator.report({'WARNING'}, f"'{anim_name}': the game plays it on its '{mask_name}' bone mask, but the "
-                                     "armature has no such mask; every bone was keyed.")
-    return mask_bones
 
 
 def _new_action(animation_data, action_name, additive, as_nla_track):
@@ -1879,9 +1744,6 @@ def build(operator, context, filepath, jba):
     # Sample i is at i / jba.fps seconds, which is placed at that time in the
     # scene's frame rate, whatever it is (see top of file: TIMING).
     scene = context.scene
-    if operator.set_scene_fps:
-        scene.render.fps = 30
-        scene.render.fps_base = 1.0
     scene_fps = scene.render.fps / scene.render.fps_base
     frames_per_sample = scene_fps / jba.fps if jba.fps > 0 else 1.0
     frames = [1 + anim_frame * frames_per_sample for anim_frame in range(jba.num_frames)]
@@ -1908,21 +1770,8 @@ def build(operator, context, filepath, jba):
     else:
         source_offsets = {}
 
-    # The game's action list (see top of file: ACTION LIST)
-    action_list = _action_list(context, filepath, ob)
-    action_info = action_list.get(anim_name) if action_list else None
-    mask_name = action_list.mask_for(anim_name) if action_list else None
-    mask_bones = None
-    if getattr(operator, "masked_bones_only", False) and mask_name and not additive:
-        mask_bones = _masked_bones(operator, context, ob, mask_name, animated_bones, anim_name)
-
-    # A masked import is named as such, so it's never mistaken for the whole
-    # animation: "em_wave_[masked_upperbody]".
-    action_name = f"{anim_name}_[masked_{mask_name}]" if mask_bones else anim_name
     animation_data = ob.animation_data
-    action = _new_action(animation_data, action_name, additive, operator.import_as_nla)
-    if mask_bones:
-        action["swtor_masked"] = mask_name
+    action = _new_action(animation_data, anim_name, additive, operator.import_as_nla)
 
     # Keyframes go into the active action first; keep NLA's keyframe
     # remapping out of it while they're inserted.
@@ -1934,8 +1783,6 @@ def build(operator, context, filepath, jba):
     # pose bone is left showing the last frame, as keyframe_insert() would.
     key_types = _new_key_types(context)
     for anim_bone in animated_bones:
-        if mask_bones and anim_bone.name not in mask_bones:
-            continue
         pose_bone = ob.pose.bones[anim_bone.name]
         ignore_translation = (not additive and operator.ignore_facial_bones
                               and anim_bone.name.lower().startswith("fc_"))
@@ -1962,15 +1809,8 @@ def build(operator, context, filepath, jba):
 
     _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample, key_types)
 
-    if action_info is not None:
-        _apply_action_info(operator, action, action_info, mask_name, frames, anim_name)
-
     animation_data.action_blend_type, animation_data.action_influence = saved_blend
-    _finish_action(animation_data, action_name, additive, operator.import_as_nla)
-
-    if operator.set_frame_range:
-        scene.frame_start = 1
-        scene.frame_end = max(1, math.ceil(1 + (jba.num_frames - 1) * frames_per_sample - 1e-6))
+    _finish_action(animation_data, anim_name, additive, operator.import_as_nla)
 
     skipped = len(jba.bones) - len(animated_bones)
     if skipped:

@@ -97,8 +97,7 @@ see types/spec.py and _apply_character_spec()), when one is found:
 'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (the rig's
 animation folder and action list, resources-relative) and
 'swtor_resources_root'. The .jba importer uses them to find the rig's
-animation data. The spec's bone masks become bone collections
-("Mask: upperbody").
+animation data.
 
 
 Data deliberately NOT kept
@@ -394,9 +393,6 @@ def build_armature(gr2, filepath, scale_object=False, scale_factor=1.0, apply_ax
         return None
 
 
-MASK_COLLECTION_PREFIX = "Mask: "
-
-
 def _apply_character_spec(ob, armature, filepath, operator):
     # type: (bpy.types.Object, bpy.types.Armature, str, Optional[bpy.types.Operator]) -> None
     """
@@ -405,8 +401,7 @@ def _apply_character_spec(ob, armature, filepath, operator):
     Directory's) and stores what the .jba importer needs on the armature:
     'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (both
     resources-relative, "/"-separated) and 'swtor_resources_root' (if known).
-    The spec's bone masks become bone collections ("Mask: upperbody"). Nothing
-    happens if there's no spec: the .jba importer then falls back to finding
+    Nothing happens if there's no spec: the .jba importer then falls back to finding
     the rig's folder by name.
     """
     from ..types.spec import find_character_spec, spec_folders_for
@@ -431,17 +426,8 @@ def _apply_character_spec(ob, armature, filepath, operator):
     if spec.resources_root:
         ob["swtor_resources_root"] = spec.resources_root
 
-    for mask_name, weights in spec.masks.items():
-        bones = [armature.bones[name] for name, weight in weights.items() if weight > 0 and name in armature.bones]
-        if not bones:
-            continue
-        collection = armature.collections.new(MASK_COLLECTION_PREFIX + mask_name)
-        for bone in bones:
-            collection.assign(bone)
-
-    masks = ", ".join(spec.masks) or "none"
     _report(operator, 'INFO', f"'{ob.name}': character specification '{spec.name}' (animations in "
-                              f"{spec.anim_folder or '?'}, bone masks: {masks}).")
+                              f"{spec.anim_folder or '?'}).")
 
 
 def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created):
