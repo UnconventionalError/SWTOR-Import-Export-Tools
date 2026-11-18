@@ -378,8 +378,13 @@ def build(operator, context, cloth, filepath):
     # type: (Operator, Context, Cloth, str) -> bool
     import bpy
 
-    target_ob = context.active_object
-    attaching_to_existing = bool(target_ob and target_ob.type == 'ARMATURE')
+    # Target comes from operator.armature_name if given, else the active armature,
+    # else None (a standalone armature is created below).
+    from .import_clo import resolve_target_armature
+    target_ob, resolved = resolve_target_armature(operator, context)
+    if not resolved:
+        return False
+    attaching_to_existing = target_ob is not None
 
     prefs = bpy.context.preferences.addons["swtor_io_tools"].preferences
     scale_factor = prefs.gr2_scale_factor if prefs.gr2_scale_object else 1.0
