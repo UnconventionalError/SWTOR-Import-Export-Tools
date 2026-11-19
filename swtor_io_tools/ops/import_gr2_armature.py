@@ -35,17 +35,25 @@ How the bones are built
 • Limb-aligned bones. SWTOR (3ds Max Biped) bones run along their local X
   axis, while a Blender bone always points along its local Y, so with the
   file's axes as they are, bones point sideways from their limbs. Every
-  bone's rest matrix is therefore the file's turned by the same exact 90°
-  about its own Z axis (LIMB_AXIS_REMAP):
+  bone's rest matrix (attachment bones apart, see below) is therefore the
+  file's turned by the same exact 90° about its own Z axis (LIMB_AXIS_REMAP):
       Blender X = -file Y,  Blender Y = file X,  Blender Z = file Z
   Head positions and rest-pose deformation are unchanged; only the axes'
   names differ. Bones point down their limbs as plain Stick bones, and
   Blender's X-Mirror works on 26 of bmnnew's 28 Left/Right pairs (1 of 28
-  with the file's axes). The 90° turn is stored on every bone
+  with the file's axes). Each bone's turn is stored on it
   ('gr2_rest_correction') and the armature is flagged
   'gr2_bone_orientation' = 'LIMB'.
   .jba animations are authored against the file's axes: ops/import_jba.py
   undoes the turn for the math and reapplies it to the result.
+
+• Attachment bones (Left/RightWeapon, socket_*, attach_*: see
+  ATTACHMENT_PREFIXES) are NOT turned: their 'gr2_rest_correction' is the
+  identity. The game places weapons and other attached meshes directly in
+  these bones' frames, so a mesh given a Copy Transforms or Child Of
+  constraint to one of them sits exactly as in the game. Turned, it would be
+  90° off about the bone's Z (checked with blaster_low05_a02_v02 on bmnnew's
+  RightWeapon during cb_pistol_idle_1: 90.0° turned, 0.0° unturned).
 
 • Each bone's rest matrix is set directly with EditBone.matrix, so its head
   position and all three local axes (including roll) are exactly the
@@ -97,8 +105,10 @@ see types/spec.py and _apply_character_spec()), when one is found:
 'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (the rig's
 animation folder and action list, resources-relative) and
 'swtor_resources_root'. The .jba importer uses them to find the rig's
-animation data. The spec's bone masks become bone collections
-("Mask: upperbody").
+animation data. With the Create Bone Mask Groups option (Import Advanced Options, off
+by default), the spec's bone masks also become bone collections
+("Mask: upperbody"); the .jba importer reads the masks from the spec when
+there are none.
 
 
 Data deliberately NOT kept
@@ -158,6 +168,20 @@ LIMB_AXIS_REMAP = Matrix(((0.0, 1.0, 0.0, 0.0),
                           (0.0, 0.0, 1.0, 0.0),
                           (0.0, 0.0, 0.0, 1.0)))
 
+# Name prefixes shared by the rules below, so they can't drift apart:
+# bone collections (Weapon: socket_*, Engine: attach_*) and the attachment
+# bones' rest correction (ATTACHMENT_PREFIXES).
+SOCKET_PREFIX = "socket_"
+ATTACH_PREFIX = "attach_"
+
+# Attachment bones keep the file's own axes (no LIMB_AXIS_REMAP): the game
+# places weapons and other attached meshes directly in these bones' frames
+# (a weapon .gr2's origin is its grip, its barrel runs along +Y), so with the
+# file's axes a Copy Transforms / Child Of constraint to the bone places the
+# mesh exactly as the game does. Turned, it would be 90° off about the
+# bone's Z. They're dots, so pointing them down a limb would gain nothing.
+ATTACHMENT_PREFIXES = (SOCKET_PREFIX, ATTACH_PREFIX)
+
 # A body bone reaches its child when the child lies within this angle of the
 # bone's own (remapped) axis, else it's a dot.
 LIMB_MAX_CHILD_ANGLE = 60.0
@@ -181,7 +205,7 @@ SECONDARY_KEYWORDS = ("Twist", "BlendShoulder", "Ulna")
 SECONDARY_NAMES = {"Root", "RootSpine", "Skirt1", "Skirt2"}
 WEAPON_NAMES = {"LeftWeapon", "RightWeapon"}
 ENGINE_NAMES = {"GrannyRootBone", "Master", "Bip01", "Camera", "NamePlate"}
-ENGINE_PREFIXES = ("attach_", "fc_wrinkle")
+ENGINE_PREFIXES = (ATTACH_PREFIX, "fc_wrinkle")
 VFX_PREFIX = "vfx_"
 VFX_NAMES = {"FxRoot"}
 
@@ -249,12 +273,24 @@ def _bone_collection_names(names):
             group = "Secondary"
         elif name.startswith(FACE_PREFIX):
             group = "Face"
-        elif name.startswith("socket_") or name in WEAPON_NAMES:
+        elif name.startswith(SOCKET_PREFIX) or name in WEAPON_NAMES:
             group = "Weapon"
         else:
             group = "Primary"
         result.append(group)
     return result
+
+
+def _rest_corrections(names):
+    # type: (List[str]) -> List[Matrix]
+    """
+    Each bone's rest correction C (Blender rest = file rest @ C):
+    LIMB_AXIS_REMAP, except for attachment bones (see ATTACHMENT_PREFIXES),
+    which keep the file's axes.
+    """
+    identity = Matrix.Identity(4)
+    return [identity if name in WEAPON_NAMES or name.startswith(ATTACHMENT_PREFIXES) else LIMB_AXIS_REMAP
+            for name in names]
 
 
 def _limb_lengths(names, parents, rest):
@@ -348,16 +384,16 @@ def _report(operator, level, message):
         print(f"{level}: {message}")
 
 
-def _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count):
-    # type: (list, bpy.types.Object, List[str], Matrix, float, int) -> str
+def _accuracy_summary(bones, ob, blender_names, corrections, rotation, scale, mirror_count):
+    # type: (list, bpy.types.Object, List[str], List[Matrix], Matrix, float, int) -> str
     """Checks the built armature against the file's own matrices (scaled/rotated as imported)."""
     max_rest_error = 0.0
-    for bone, blender_name in zip(bones, blender_names):
+    for bone, blender_name, correction in zip(bones, blender_names, corrections):
         b = ob.data.bones[blender_name]
         if "gr2_mirror_axis" in b:
             continue
         expected = _convert(_matrix_from_column_major(bone.root_to_bone).inverted_safe(), rotation, scale)
-        expected = expected @ LIMB_AXIS_REMAP
+        expected = expected @ correction
         actual = b.matrix_local
         max_rest_error = max(max_rest_error, max(abs(actual[r][c] - expected[r][c])
                                                  for r in range(4) for c in range(4)))
@@ -370,17 +406,23 @@ def _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count):
     return summary
 
 
-def build_armature(gr2, filepath, scale_object=False, scale_factor=1.0, apply_axis_conversion=False, operator=None):
-    # type: (object, str, bool, float, bool, Optional[bpy.types.Operator]) -> Optional[bpy.types.Object]
+def build_armature(gr2, filepath, scale_object=False, scale_factor=1.0, apply_axis_conversion=False, operator=None,
+                   create_bone_mask_groups=False):
+    # type: (object, str, bool, float, bool, Optional[bpy.types.Operator], bool) -> Optional[bpy.types.Object]
     """
     Builds the armature Object for a parsed skeleton file (a Granny2 whose
     bone_buffer holds the bones) and returns it, active and selected, or
     None (after reporting why) if it couldn't be built. Leaves Blender in
     Object Mode.
+
+    create_bone_mask_groups: also makes a 'Mask: <name>' bone collection (a bone
+    mask group) for each of the character specification's bone masks (see
+    _apply_character_spec()).
     """
     created = []  # (object, armature) pairs, to remove if building fails part-way
     try:
-        return _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created)
+        return _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created,
+                      create_bone_mask_groups)
     except Exception as error:  # soft-fail: report, don't raise (the file is skipped)
         traceback.print_exc()
         if bpy.ops.object.mode_set.poll():
@@ -397,16 +439,17 @@ def build_armature(gr2, filepath, scale_object=False, scale_factor=1.0, apply_ax
 MASK_COLLECTION_PREFIX = "Mask: "
 
 
-def _apply_character_spec(ob, armature, filepath, operator):
-    # type: (bpy.types.Object, bpy.types.Armature, str, Optional[bpy.types.Operator]) -> None
+def _apply_character_spec(ob, armature, filepath, operator, create_bone_mask_groups=False):
+    # type: (bpy.types.Object, bpy.types.Armature, str, Optional[bpy.types.Operator], bool) -> None
     """
     Looks up the skeleton's character specification (types/spec.py: the
     .dyc/.dat files next to it in art/dynamic/spec, or in the Resources
     Directory's) and stores what the .jba importer needs on the armature:
     'swtor_spec', 'swtor_anim_folder' and 'swtor_anim_metadata' (both
     resources-relative, "/"-separated) and 'swtor_resources_root' (if known).
-    The spec's bone masks become bone collections ("Mask: upperbody"). Nothing
-    happens if there's no spec: the .jba importer then falls back to finding
+    With create_bone_mask_groups, the spec's bone masks become bone collections
+    (bone mask groups, "Mask: upperbody"); without it the .jba importer reads the masks from the
+    spec itself (see _mask_bones() there). Nothing happens if there's no spec: the .jba importer then falls back to finding
     the rig's folder by name.
     """
     from ..types.spec import find_character_spec, spec_folders_for
@@ -431,20 +474,24 @@ def _apply_character_spec(ob, armature, filepath, operator):
     if spec.resources_root:
         ob["swtor_resources_root"] = spec.resources_root
 
-    for mask_name, weights in spec.masks.items():
-        bones = [armature.bones[name] for name, weight in weights.items() if weight > 0 and name in armature.bones]
-        if not bones:
-            continue
-        collection = armature.collections.new(MASK_COLLECTION_PREFIX + mask_name)
-        for bone in bones:
-            collection.assign(bone)
+    created_groups = []
+    if create_bone_mask_groups:
+        for mask_name, weights in spec.masks.items():
+            bones = [armature.bones[name] for name, weight in weights.items() if weight > 0 and name in armature.bones]
+            if not bones:
+                continue
+            collection = armature.collections.new(MASK_COLLECTION_PREFIX + mask_name)
+            for bone in bones:
+                collection.assign(bone)
+            created_groups.append(mask_name)
 
-    masks = ", ".join(spec.masks) or "none"
-    _report(operator, 'INFO', f"'{ob.name}': character specification '{spec.name}' (animations in "
-                              f"{spec.anim_folder or '?'}, bone masks: {masks}).")
+    message = f"'{ob.name}': character specification '{spec.name}' (animations in {spec.anim_folder or '?'}"
+    if create_bone_mask_groups:
+        message += f"; bone mask groups: {', '.join(created_groups) or 'none'}"
+    _report(operator, 'INFO', message + ").")
 
 
-def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created):
+def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, operator, created, create_bone_mask_groups=False):
     # The bones, in file order, as the file stores them
     if sorted(gr2.bone_buffer) != list(range(len(gr2.bone_buffer))):
         raise ValueError("the bone indices aren't consecutive")
@@ -468,7 +515,8 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
         mirror_axes.append(axis)
 
     rotation, scale = _import_conversion(apply_axis_conversion, scale_object, scale_factor)
-    rest = [_convert(matrix, rotation, scale) @ LIMB_AXIS_REMAP for matrix in rest]
+    corrections = _rest_corrections(names)
+    rest = [_convert(matrix, rotation, scale) @ correction for matrix, correction in zip(rest, corrections)]
     lengths = _limb_lengths(names, parents, rest)
 
     # Create the armature object
@@ -516,8 +564,7 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
     _refine_rolls(armature, blender_names, rest)
 
     # Per-bone data
-    rest_correction = [v for row in LIMB_AXIS_REMAP.to_3x3() for v in row]
-    for index, (bone, axis, blender_name) in enumerate(zip(bones, mirror_axes, blender_names)):
+    for index, (bone, axis, blender_name, correction) in enumerate(zip(bones, mirror_axes, blender_names, corrections)):
         b = armature.bones[blender_name]
         if blender_name != bone.name:
             b["gr2_name"] = bone.name
@@ -528,7 +575,7 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
             b["gr2_mirror_axis"] = axis
         # rest = file rest @ this (3x3, row by row), for tools such as
         # ops/import_jba.py to convert between the two
-        b["gr2_rest_correction"] = rest_correction
+        b["gr2_rest_correction"] = [v for row in correction.to_3x3() for v in row]
 
     # Bone collections
     collections = {}
@@ -561,10 +608,10 @@ def _build(gr2, filepath, scale_object, scale_factor, apply_axis_conversion, ope
     ob["import_scale"] = scale
     ob["import_axis_conversion"] = bool(apply_axis_conversion)
 
-    _apply_character_spec(ob, armature, filepath, operator)
+    _apply_character_spec(ob, armature, filepath, operator, create_bone_mask_groups)
 
     mirror_count = sum(1 for axis in mirror_axes if axis)
-    summary = _accuracy_summary(bones, ob, blender_names, rotation, scale, mirror_count)
+    summary = _accuracy_summary(bones, ob, blender_names, corrections, rotation, scale, mirror_count)
     print(f"ARMATURE: '{filepath}': {summary}")
     _report(operator, 'INFO', f"Imported '{ob.name}': {summary}")
 

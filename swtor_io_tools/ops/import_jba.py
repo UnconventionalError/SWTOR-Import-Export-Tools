@@ -122,8 +122,10 @@ All of it is stored on the action as swtor_* custom properties. Looping
 animations get a cyclic action (Cycles modifiers, cyclic frame range). Blend
 times are not applied to NLA strips: a strip that blends in fades from the
 rest pose when nothing plays below it. With Masked Bones Only, an animation
-with a mask keys only the mask's bones (the armature's 'Mask: ...' bone
-collection, from its .dyc), so it can be layered over locomotion.
+with a mask keys only the mask's bones: the armature's 'Mask: ...' bone
+collection (made by the .gr2 import option 'Create Bone Mask Groups') if it
+has one, else the mask in the rig's character specification (its .dyc). So it
+can be layered over locomotion.
 
 ADDITIVE ANIMATIONS
 Some .jba files (in bmnnew, the 1060 'ad_' ones: facial expressions, aim and
@@ -204,6 +206,7 @@ from ..types.mph import BONES_FROM_DATA, BONES_FROM_LIBRARY, BONES_INFERRED, MPH
 from ..types.aam import ActionList, read_action_list
 from ..types.amx import folder_sources
 from ..types.spec import find_character_spec, spec_folders_for
+from ..utils.file_browser import is_file_call, remember_folder
 from ..utils.string import path_split
 
 
@@ -306,12 +309,6 @@ class ImportJBA(Operator):
     ignore_facial_bones: BoolProperty(
         name="Ignore Face Bones",
         description="Ignores the data in the facial bones' translation keyframes\nand only uses their rotation keyframes.\n\nAbsolute animations only: in additive ones, facial translations\nare part of the expression (e.g. raised brows)",
-        default=True,
-    )
-
-    delete_180: BoolProperty(
-        name="Delete 180º Rotation",
-        description="Keeps the animation data from turning the skeleton 180º by deleting\nthe keyframes assigned to the Bip01 bone and setting its rotation to zero.\n\nSWTOR animations turn characters so that they face away from the camera,\nas normally shown in the gameplay. That is not just a nuisance but a problem\nwhen adding cloth or physics simulations to capes or lekku: the instantaneous\nturn plays havok with them",
         default=False,
     )
 
@@ -336,12 +333,12 @@ class ImportJBA(Operator):
     cyclic_loops: BoolProperty(
         name="Loop Looping Animations",
         description="Animations the game plays as loops (its action list's 'ambient' ones, e.g. idles)\nget a cyclic action: Cycles modifiers on their F-curves and a cyclic\nframe range, so they repeat when played past their end.\n\nThe game's blend times and bone mask are stored on every action\n(swtor_* custom properties) either way.\n\nOff: looping animations play once, like the others",
-        default=True,
+        default=False,
     )
 
     masked_bones_only: BoolProperty(
         name="Masked Bones Only",
-        description="For animations the game plays on part of the body (its action list gives them a\nbone mask, e.g. 'upperbody', so they can play over the legs' walk), keys only\nthe mask's bones (the armature's 'Mask: ...' bone collection), so the action\ncan be layered over a locomotion action in the NLA. Masked imports are named as\nsuch: 'em_wave_[masked_upperbody]'.\n\nThis leaves out the clip's other bones.\n\nOff: every bone in the clip is keyed",
+        description="For animations the game plays on part of the body (its action list gives them a\nbone mask, e.g. 'upperbody', so they can play over the legs' walk), keys only\nthe mask's bones (the armature's 'Mask: ...' bone collection, made by the .gr2\nimporter's 'Create Bone Mask Groups' option, if it has one, else the rig's\ncharacter specification's), so the action\ncan be layered over a locomotion action in the NLA. Masked imports are named as\nsuch: 'em_wave_[masked_upperbody]'.\n\nThis leaves out the clip's other bones.\n\nOff: every bone in the clip is keyed",
         default=False,
     )
 
@@ -350,7 +347,7 @@ class ImportJBA(Operator):
         description="Sets the scene's frame rate to 30 fps.\n\nThe keyframes are placed at their real time in the scene's frame rate either way. "
                     "SWTOR animations are nearly all 15 or 30 fps, so at 30 fps their keyframes land on whole frames (a 15 fps "
                     "animation on every second one), while other rates, such as Blender's default of 24 fps, put them "
-                    "between frames.\n\nThis changes the whole scene, including cloth simulations",
+                    "between frames.\n\nThis changes the whole scene, including cloth simulations and should only be done if you know why you are doing it.",
         default=False,
     )
 
@@ -380,7 +377,6 @@ class ImportJBA(Operator):
         # The options start from the add-on's preferences.
         prefs = _prefs(context)
         self.ignore_facial_bones = prefs.jba_ignore_facial_bones
-        self.delete_180 = prefs.jba_delete_180
         self.import_as_nla = prefs.jba_import_as_nla
         self.repair_broken_frames = prefs.jba_repair_broken_frames
         self.fit_to_armature = prefs.jba_fit_to_armature
@@ -389,11 +385,12 @@ class ImportJBA(Operator):
         self.scale_animation = prefs.gr2_scale_object
         self.scale_factor = prefs.gr2_scale_factor
 
-        # A filepath passed in by a script imports straight away.
-        if not self.filepath:
-            context.window_manager.fileselect_add(self)
-            return {'RUNNING_MODAL'}
-        return self.execute(context)
+        # A file path passed in by a script imports straight away. (After an
+        # import `filepath` holds just the folder, so the File Browser reopens there.)
+        if is_file_call(self.filepath):
+            return self.execute(context)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
 
     def draw(self, context):
@@ -406,15 +403,22 @@ class ImportJBA(Operator):
         header.label(text="Import Options")
         if body:
             body.prop(self, "animation_type")
-            body.prop(self, "ignore_facial_bones")
-            body.prop(self, "delete_180")
             body.prop(self, "import_as_nla")
-            body.prop(self, "repair_broken_frames")
             body.prop(self, "fit_to_armature")
+            body.prop(self, "repair_broken_frames")
+
+
+        # Rarely needed, so a collapsible sub-panel that starts collapsed.
+        # body is None while the sub-panel is collapsed.
+        header, body = layout.panel("SWTOR_IO_Adv_JBA_Options", default_closed=True)
+        header.label(text="Import Advanced Options")
+        if body:
+            
             body.prop(self, "cyclic_loops")
             body.prop(self, "masked_bones_only")
             body.prop(self, "set_scene_fps")
             body.prop(self, "set_frame_range")
+            body.prop(self, "ignore_facial_bones")
 
         # Rarely needed, so a collapsible sub-panel that starts collapsed.
         # body is None while the sub-panel is collapsed.
@@ -432,10 +436,10 @@ class ImportJBA(Operator):
         if not paths:
             paths.append(self.filepath)
 
-        # Cleared now that they've been read, so they don't linger if the
-        # import fails part-way (which makes debugging confusing).
-        self.files.clear()
-        self.filepath = ""
+        # The selection is dropped now that it's been read, so it doesn't linger if
+        # the import fails part-way (which makes debugging confusing), but the folder
+        # stays: the next File Browser opens there.
+        remember_folder(self, paths)
 
         for path in paths:
             if not load(self, context, path):
@@ -1968,20 +1972,8 @@ def build(operator, context, filepath, jba):
 
         pose_bone.matrix_basis = mat_basis
         _key_channels(action, ob, key_types, pose_bone.path_from_id("location"), pose_bone.name, frames, locations)
-        if not (operator.delete_180 and anim_bone.name in KNOWN_180_FLIP_BONES):
-            _key_channels(action, ob, key_types, pose_bone.path_from_id("rotation_quaternion"), pose_bone.name,
-                          frames, rotations)
-
-    # Delete 180º Rotation: unlike the rest-pose correction (KNOWN_180_FLIP_BONES,
-    # always applied, which keeps an unanimated Bip01 from coming out flipped),
-    # this drops a clip's genuinely animated ~180° character turn (SWTOR turns
-    # characters to face away from the camera), which can wreck cloth and
-    # physics simulations. Bip01's rotation isn't keyed at all (above), and
-    # is set to identity for the whole clip.
-    if operator.delete_180:
-        for bone_name in KNOWN_180_FLIP_BONES:
-            if bone_name in ob.pose.bones:
-                ob.pose.bones[bone_name].rotation_quaternion = (1, 0, 0, 0)
+        _key_channels(action, ob, key_types, pose_bone.path_from_id("rotation_quaternion"), pose_bone.name,
+                      frames, rotations)
 
     _key_world_motion(operator, ob, jba, morpheme_space, morpheme_space_inv, frames_per_sample, key_types)
 

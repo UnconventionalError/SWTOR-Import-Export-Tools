@@ -36,6 +36,7 @@ from .import_hms import DEFAULT_MAX_VIEWPORT_INSTANCES, HmsBatch, process_terrai
 from .process_materials import apply_materials_by_name_to_gr2_objects, _summarize_and_report
 from ..types import area as area_types
 from ..types.shared import job_results, resolve_resource_path
+from ..utils.file_browser import remember_folder
 
 # NOTE: ops/import_fxspec.py is still imported lazily here (see
 # _process_fxspec_element's own function-local import), a leftover from
@@ -1553,12 +1554,10 @@ class ImportAREA(bpy.types.Operator):
         if not paths:
             paths.append(self.filepath)
 
-        # Clear filebrowser-related properties now that they've been
-        # read, same reasoning as ImportGR2's own execute(): keeps them
-        # from persisting if this breaks before finishing, which makes
-        # debugging harder otherwise.
-        self.files.clear()
-        self.filepath = ""
+        # Drop the selection now that it's been read, same reasoning as
+        # ImportGR2's own execute() (keeps it from persisting if this breaks
+        # before finishing), but keep the folder for the next File Browser.
+        remember_folder(self, paths)
 
         if not self.job_results_accumulate:
             job_results['objs_names'] = []

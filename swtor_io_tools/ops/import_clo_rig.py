@@ -53,11 +53,19 @@ import os
 from math import pi as PI
 from typing import List, Optional, Set
 
-from bpy.types import Context, Object, Operator
+from bpy.types import Armature, Context, Object, Operator
 from mathutils import Matrix, Quaternion, Vector
 
 from ..types.clo import Cloth
 from .import_clo import _find_sibling_mesh
+
+# Bone collections this importer fills (see _assign_bone_collections()). An existing
+# collection of the same name is reused. THEME09 (yellow) is not used by any of the
+# .gr2 skeleton importer's collections (Primary/Secondary/Face/Weapon/VFX/Engine), so
+# cloth bones stand out from the body's.
+CLOTH_COLLECTION_NAME = "Cloth"
+CLOTH_BONE_PALETTE = 'THEME09'
+PLACEHOLDER_COLLECTION_NAME = "Placeholder"  # Left at the default (gray) bone color.
 
 
 def _bone_rest_position(bone):
@@ -231,27 +239,96 @@ def _spanning_tree_from_pins(cloth, pins, unweighted=frozenset()):
             seen.add(current)
         return False
 
+    skipped = []
     for target, claimant in end_claims.items():
         if not leads_back_to(claimant, target):
             parent_of[target] = claimant
+        else:
+            skipped.append((target, claimant))
+    # A claim can look cyclic only because another claim, applied later, hadn't yet
+    # re-parented the claimant: retry those once everything else has been applied.
+    for target, claimant in skipped:
+        if not leads_back_to(claimant, target):
+            parent_of[target] = claimant
 
+    _settle_convergence_tips(cloth, pins, unweighted, end_claims, parent_of, leads_back_to)
     return parent_of
+
+
+def _settle_convergence_tips(cloth, pins, unweighted, end_claims, parent_of, leads_back_to):
+    # type: (Cloth, List[Cloth.Bone], Set[int], dict, dict, object) -> None
+    """
+    Several strands can all name the same particle as their end (a gathered hem, a drawstring
+    tip): endParticle is then ambiguous, so no claim is made and the tip simply hangs off
+    whichever neighbour was nearest by rest length -- which can be the LAST bone of a
+    strand that only reaches it sideways, leaving a bone crossing from one strand to
+    another (chest_dancer01_bfn_light_ge_a21_loin: the left strand's last bone carried the
+    centre tip across the hem, and the tip's tail then carried straight on past it).
+
+    The tip belongs to the strand that arrives at it in a straight line, so among the
+    claimants that are joined to it by an edge, the one whose own direction of travel
+    (its parent -> itself) already points at the tip takes it as a child. Only done when
+    that is clear-cut (a single claimant clearly straighter than the rest); otherwise the
+    nearest-neighbour result stands.
+    """
+    seeds = {pin.index for pin in pins}
+    edge_pairs = set()
+    for edge in cloth.edges:
+        if edge.node1 not in unweighted and edge.node2 not in unweighted:
+            edge_pairs.add((min(edge.node1, edge.node2), max(edge.node1, edge.node2)))
+
+    claimants_of = {}
+    for bone in cloth.bones:
+        if bone.index in unweighted:
+            continue
+        target = bone.endParticle
+        if 0 <= target < len(cloth.bones) and target != bone.index and target not in unweighted:
+            claimants_of.setdefault(target, []).append(bone.index)
+
+    for target, claimants in claimants_of.items():
+        if target in end_claims or target in seeds or len(claimants) < 2:
+            continue
+        position = _bone_rest_position(cloth.bones[target])
+        scored = []
+        for claimant in claimants:
+            parent = parent_of.get(claimant)
+            if parent is None or (min(claimant, target), max(claimant, target)) not in edge_pairs:
+                continue
+            claimant_position = _bone_rest_position(cloth.bones[claimant])
+            travel = claimant_position - _bone_rest_position(cloth.bones[parent])
+            onward = position - claimant_position
+            if travel.length < 1e-9 or onward.length < 1e-9:
+                continue
+            scored.append((travel.normalized().dot(onward.normalized()), claimant))
+        scored.sort(reverse=True)
+        if scored and scored[0][0] >= 0.9 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.1):
+            claimant = scored[0][1]
+            if not leads_back_to(claimant, target):
+                parent_of[target] = claimant
 
 
 def _find_unweighted_bones(cloth, mesh_ob, pins):
     # type: (Cloth, 'bpy.types.Object', List[Cloth.Bone]) -> Set[int]
     """
-    Bone indices with no real influence on MESH_OB: either no vertex group of that name
-    exists at all, or the group exists but sums to (essentially) zero weight across every
-    vertex. A single pass over the mesh's vertices totals every group at once rather than
-    re-scanning per bone.
+    Bone indices nothing on MESH_OB depends on, so the rig leaves them out:
 
-    Pins are never included here, regardless of their own weight: verified against real
-    files that a true pin routinely carries ZERO vertex weight by design (the mesh right
-    at a rigid anchor point gets skinned directly to the real bone instead of routing
-    through an identity-transform pin copy of it), so judging a pin by its own weight
-    prunes the actual structural root while keeping ordinary mid-chain bones -- exactly
-    backwards.
+      * A non-pin bone with no real influence on the mesh: either no vertex group of that
+        name exists at all, or the group exists but sums to (essentially) zero weight across
+        every vertex. A single pass over the mesh's vertices totals every group at once
+        rather than re-scanning per bone.
+
+      * A PIN with no influence of its own AND no weighted bone beneath it in the rig's
+        spanning tree. Judging a pin by its own weight alone is wrong, because a true pin
+        routinely carries ZERO vertex weight by design (the mesh right at a rigid anchor
+        point gets skinned directly to the real bone instead of routing through an
+        identity-transform pin copy of it): pruning those prunes the actual structural root
+        while keeping ordinary mid-chain bones -- exactly backwards. So a zero-weight pin
+        stays when it is the root of something weighted. But it is just an unused anchor,
+        and its chain of fellow pins with it, when every weighted bone hangs off a different
+        root: verified on head_pcnautolan_bmn_a01, where 20 zero-weight pins form six
+        chains (077->066->055->044, 071->060->049->038 and four of three) that no weighted
+        bone is parented under. Their edges only tug on weighted particles in the original
+        simulation, which the rig does not reproduce.
     """
     pin_indices = {pin.index for pin in pins}
     totals = [0.0] * len(mesh_ob.vertex_groups)
@@ -260,14 +337,30 @@ def _find_unweighted_bones(cloth, mesh_ob, pins):
             if group_element.group < len(totals):
                 totals[group_element.group] += group_element.weight
 
+    weighted = set()
     unweighted = set()
     for bone in cloth.bones:
-        if bone.index in pin_indices:
-            continue
         vertex_group = mesh_ob.vertex_groups.get(bone.name)
-        if vertex_group is None or totals[vertex_group.index] <= 1e-6:
+        if vertex_group is not None and totals[vertex_group.index] > 1e-6:
+            weighted.add(bone.index)
+        elif bone.index not in pin_indices:
             unweighted.add(bone.index)
-    return unweighted
+
+    # Which bones are needed to hold a weighted one: itself, and everything above it in
+    # the same spanning tree the rig is built from (see build()). Pruning a pin changes
+    # which pins seed the tree, so repeat until nothing more drops out.
+    while True:
+        tree_parent_of = _spanning_tree_from_pins(cloth, _seed_pins(cloth, pins, unweighted), unweighted)
+        needed = set(weighted)
+        for index in weighted:
+            ancestor = tree_parent_of.get(index)
+            while ancestor is not None and ancestor not in needed:
+                needed.add(ancestor)
+                ancestor = tree_parent_of.get(ancestor)
+        newly_unneeded = (pin_indices - needed) - unweighted
+        if not newly_unneeded:
+            return unweighted
+        unweighted.update(newly_unneeded)
 
 
 def _effective_parent(bone_index, tree_parent_of, unweighted):
@@ -282,14 +375,34 @@ def _effective_parent(bone_index, tree_parent_of, unweighted):
     return parent_index
 
 
+def _surviving_end(cloth, bone_index, unweighted):
+    # type: (Cloth, int, Set[int]) -> Optional[int]
+    """The first bone, following endParticle from BONE_INDEX and passing through any pruned
+    (unweighted) bones on the way, that is not pruned: where this bone's designed segment
+    carries on to in the final rig. None if it ends, loops or points nowhere valid."""
+    count = len(cloth.bones)
+    seen = {bone_index}
+    target = cloth.bones[bone_index].endParticle
+    while 0 <= target < count and target not in seen:
+        if target not in unweighted:
+            return target
+        seen.add(target)
+        target = cloth.bones[target].endParticle
+    return None
+
+
 def _unambiguous_end_claims(cloth, unweighted=frozenset()):
     # type: (Cloth, Set[int]) -> dict
     """
     {target_bone_index: claimant_bone_index} for every particle with exactly one bone
     naming it as their own endParticle -- OR, when several bones name the same target,
-    exactly one of those claimants that ALSO has a genuine edges[] entry to it. Claims
-    involving a pruned (unweighted) bone on either side are dropped too -- it won't exist
-    in the final rig, so it can't meaningfully be anyone's parent or child.
+    exactly one of those claimants that ALSO has a genuine edges[] entry to it. A claim whose
+    target was pruned (unweighted) carries on through it: the segment still continues past
+    a skipped bone, so the claimant claims the first surviving bone further along (see
+    _surviving_end). Without that, skipping one zero-weight bone mid-strand cut the strand
+    in two and the lower half got attached to a neighbouring strand instead
+    (head_pcnautolan_bfa_a01: a gap in one side's chain and a stray cross-branch on the
+    other). A pruned bone can't itself claim anything.
 
     Does NOT require a real edge for an otherwise-unambiguous (single-claimant) target.
     endParticle describes the file's own DESIGNED skeletal segments; edges[] describes the
@@ -309,10 +422,9 @@ def _unambiguous_end_claims(cloth, unweighted=frozenset()):
     for bone in cloth.bones:
         if bone.index in unweighted:
             continue
-        if 0 <= bone.endParticle < len(cloth.bones) and bone.endParticle != bone.index:
-            if bone.endParticle in unweighted:
-                continue
-            all_claimants.setdefault(bone.endParticle, []).append(bone.index)
+        target = _surviving_end(cloth, bone.index, unweighted)
+        if target is not None:
+            all_claimants.setdefault(target, []).append(bone.index)
 
     edge_set = set()
     for edge in cloth.edges:
@@ -347,6 +459,10 @@ def _seed_pins(cloth, pins, unweighted=frozenset()):
     same connected component, which an earlier, broader version of this function wrongly
     treated as enough justification to merge them into one seed (confirmed as a real
     regression: it broke newtonparticle002's independent strand on the robe).
+
+    The one other case is _pins_inside_single_chain(): a pin part-way along what is plainly
+    one long chain rooted by a pin at its end. That is deliberately restricted to pieces
+    with no branching or cross-bracing at all, so none of the above is affected.
     """
     end_claims = _unambiguous_end_claims(cloth, unweighted)
     pin_indices = {pin.index for pin in pins}
@@ -372,7 +488,123 @@ def _seed_pins(cloth, pins, unweighted=frozenset()):
         return False
 
     de_seeded = {target for target in claimed_by_pin if not leads_to_cycle(target)}
+    de_seeded |= _pins_inside_single_chain(cloth, pin_indices - de_seeded, unweighted)
     return [pin for pin in pins if pin.index not in de_seeded]
+
+
+def _pins_inside_single_chain(cloth, pin_indices, unweighted=frozenset()):
+    # type: (Cloth, Set[int], Set[int]) -> Set[int]
+    """
+    Pins that should NOT root their own chain because they sit inside a single long chain
+    that is already rooted by a pin at one END of it.
+
+    Looks at each connected piece of the kept (non-pruned) bones over edges[]. When a piece
+    is a plain chain -- no branches, no cross-bracing, no loops, so every bone touches at
+    most two others -- and exactly one of its two ends is a pin, that pin is the chain's
+    root and any other pin inside it is just a pinned bone part-way along. Verified on the
+    Twi'lek heads (each lekku is one chain, head tip -> neck -> ... -> tip): body types
+    that pin only the head-tip bone (head_twilek_bma_asian_a01) already came out as one
+    chain from one root, while the types that ALSO pin a bone further down the lekku
+    (bmn: lekku_05, bfn: lekku_04) split it into two roots under two different real bones.
+
+    Anything that isn't a plain chain (a mesh or grid: the shawl, the robe, the cape) is
+    left exactly as it was, and so is a chain with a pin at both ends or at neither --
+    there is no single obvious root there, so every pin keeps its own.
+    """
+    kept = {bone.index for bone in cloth.bones if bone.index not in unweighted}
+    neighbours = {index: set() for index in kept}
+    for edge in cloth.edges:
+        if edge.node1 != edge.node2 and edge.node1 in kept and edge.node2 in kept:
+            neighbours[edge.node1].add(edge.node2)
+            neighbours[edge.node2].add(edge.node1)
+
+    de_seeded = set()
+    seen = set()
+    for start in sorted(kept):
+        if start in seen:
+            continue
+        piece = set()
+        stack = [start]
+        while stack:
+            index = stack.pop()
+            if index not in piece:
+                piece.add(index)
+                stack.extend(neighbours[index] - piece)
+        seen |= piece
+
+        link_count = sum(len(neighbours[index]) for index in piece) // 2
+        if link_count != len(piece) - 1 or any(len(neighbours[index]) > 2 for index in piece):
+            continue  # Not a plain chain.
+        pins_in_piece = piece & pin_indices
+        end_pins = {index for index in pins_in_piece if len(neighbours[index]) <= 1}
+        if len(pins_in_piece) >= 2 and len(end_pins) == 1:
+            de_seeded |= pins_in_piece - end_pins
+    return de_seeded
+
+def _designed_end_position(bone, designed_end_of, cloth, head, to_armature_space):
+    # type: (Cloth.Bone, dict, Cloth, Vector, object) -> Optional[Vector]
+    """Armature-space position of the particle BONE's designed segment ends at, or None
+    if it has no (trusted) one or it coincides with the head (a zero-length bone)."""
+    target = designed_end_of.get(bone.index)
+    if target is None:
+        return None
+    position = to_armature_space(_bone_rest_position(cloth.bones[target]))
+    if (position - head).length <= 1e-6:
+        return None
+    return position
+
+
+def _assign_bone_collections(armature, cloth_bone_names, placeholder_bone_names):
+    # type: (Armature, List[str], List[str]) -> None
+    """
+    Puts the bones this import created or repositioned into bone collections:
+
+      Cloth        the cloth bones, colored with CLOTH_BONE_PALETTE. A cloth bone that
+                   already existed in the armature is moved here too (taken out of its
+                   other collections).
+      Placeholder  stand-ins for real skeleton bones (and the optional master bone).
+                   Created directly beneath Cloth, and left the default gray.
+
+    An existing collection of the same name is reused, never duplicated, so repeated
+    imports into one armature share them. A collection is only created if it has bones
+    to hold.
+    """
+    def get_or_create(name):
+        collection = armature.collections_all.get(name)
+        if collection is None:
+            collection = armature.collections.new(name)
+            return collection, True
+        return collection, False
+
+    def move_into(collection, bone_names, palette=None):
+        for name in bone_names:
+            bone = armature.bones.get(name)
+            if bone is None:
+                continue
+            for other in list(bone.collections):
+                if other != collection:
+                    other.unassign(bone)
+            collection.assign(bone)
+            if palette is not None:
+                bone.color.palette = palette
+
+    cloth_collection = None
+    if cloth_bone_names:
+        cloth_collection, _ = get_or_create(CLOTH_COLLECTION_NAME)
+        move_into(cloth_collection, cloth_bone_names, CLOTH_BONE_PALETTE)
+
+    if placeholder_bone_names:
+        placeholder_collection, created = get_or_create(PLACEHOLDER_COLLECTION_NAME)
+        move_into(placeholder_collection, placeholder_bone_names)
+        # Directly beneath Cloth, but only when this import just created it (a collection
+        # the user already has stays wherever they put it) and both are top-level.
+        if created and cloth_collection is not None and placeholder_collection.parent is None and cloth_collection.parent is None:
+            ordered = list(armature.collections_all)
+            from_index = ordered.index(placeholder_collection)
+            to_index = ordered.index(cloth_collection) + 1
+            if from_index > to_index:
+                armature.collections.move(from_index, to_index)
+
 
 def build(operator, context, cloth, filepath):
     # type: (Operator, Context, Cloth, str) -> bool
@@ -454,7 +686,8 @@ def build(operator, context, cloth, filepath):
         if unweighted:
             operator.report(
                 {'INFO'},
-                f"Skipping {len(unweighted)} bone(s) with no weight on \'{sibling_mesh.name}\': "
+                f"Skipping {len(unweighted)} bone(s) nothing on \'{sibling_mesh.name}\' depends on "
+                "(no weight, and no weighted bone beneath them): "
                 + ", ".join(sorted(cloth.bones[i].name for i in unweighted)),
             )
     else:
@@ -496,6 +729,12 @@ def build(operator, context, cloth, filepath):
     for index, children in effective_children.items():
         primary_child_of[index] = max(children, key=lambda c: (_subtree_size(c), -c))
 
+    # The particle each bone's own designed segment ends at (its endParticle), for leaf
+    # bones with no child in the final rig. Built from ALL bones, pruned ones included:
+    # a skipped tip is still exactly where the segment ends. Only unambiguous claims are
+    # trusted (see _unambiguous_end_claims), since stale endParticle data does exist.
+    designed_end_of = {claimant: target for target, claimant in _unambiguous_end_claims(cloth).items()}
+
     skipped_existing = []
     for bone in cloth.bones:
         if bone.index in unweighted:
@@ -505,7 +744,9 @@ def build(operator, context, cloth, filepath):
             continue
         edit_bones.new(bone.name)
 
-    surviving_pins = [pin for pin in pins if pin.index not in unweighted]
+    # Only pins that actually root a chain need a placeholder: a pin that sits inside another
+    # pin's chain (see _seed_pins) hangs off it instead, so its real parent isn't used.
+    surviving_pins = [pin for pin in pins if pin.index not in unweighted and effective_parent_of[pin.index] is None]
 
     # One placeholder bone per DISTINCT real-parent name (not per pin) -- e.g. the lekku's
     # two pins both reference "Head", so this creates a single "Head" placeholder, not two;
@@ -516,6 +757,7 @@ def build(operator, context, cloth, filepath):
     # approximation, whenever every contributing pin agrees (which they always have on
     # every real file tested so far).
     placeholder_of_real_parent = {}
+    placeholder_names = []  # Bone names for the Placeholder collection.
     if not attaching_to_existing:
         representative_pin = {}
         for pin in surviving_pins:
@@ -528,6 +770,7 @@ def build(operator, context, cloth, filepath):
             placeholder_eb.tail = head + Vector((0, tail_length, 0))
             placeholder_eb["clo_placeholder"] = True
             placeholder_of_real_parent[real_parent_name] = placeholder_eb
+            placeholder_names.append(placeholder_eb.name)
 
     master_eb = None
     if not attaching_to_existing and placeholder_of_real_parent and getattr(operator, "add_master_bone", True):
@@ -544,6 +787,7 @@ def build(operator, context, cloth, filepath):
         master_eb.tail = centroid + Vector((0, tail_length, 0))
         master_eb["clo_master"] = True
         master_eb["clo_real_parents"] = ", ".join(sorted(placeholder_of_real_parent))
+        placeholder_names.append(master_eb.name)
         for placeholder_eb in placeholder_of_real_parent.values():
             placeholder_eb.parent = master_eb
 
@@ -565,6 +809,15 @@ def build(operator, context, cloth, filepath):
         primary = primary_child_of.get(bone.index)
         if primary is not None:
             eb.tail = to_armature_space(_bone_rest_position(cloth.bones[primary]))
+        elif _designed_end_position(bone, designed_end_of, cloth, head, to_armature_space) is not None:
+            # Leaf, but the file designates where its segment ends (typically a tip that was
+            # skipped as unweighted, or a particle above/beside the chain that the spanning
+            # tree made its parent instead): reach exactly there. Extrapolating instead
+            # points the bone away from its own segment end -- verified on
+            # head_twilek_bfn_asian_a01, where the top lekku bone sits above the pin it
+            # belongs to and extrapolating (parent -> self) pointed it upward, away from
+            # the chain, leaving the start of the chain visibly broken.
+            eb.tail = _designed_end_position(bone, designed_end_of, cloth, head, to_armature_space)
         else:
             # Leaf: continue the same direction the chain was already travelling (parent
             # -> self, extrapolated) rather than trusting restEdgeDirection -- verified
@@ -608,6 +861,7 @@ def build(operator, context, cloth, filepath):
                     parent_eb.head = placeholder_head
                     parent_eb.tail = placeholder_head + Vector((0, tail_length, 0))
                     parent_eb["clo_placeholder"] = True
+                    placeholder_names.append(parent_eb.name)
                     operator.report(
                         {'WARNING'},
                         f"\'{bone.parent}\' isn't in the target armature; added a placeholder "
@@ -634,6 +888,13 @@ def build(operator, context, cloth, filepath):
 
     if bpy.ops.object.mode_set.poll():
         bpy.ops.object.mode_set(mode=prev_mode if prev_mode != 'EDIT' else 'OBJECT')
+
+    # Bone collections (bones are only reachable through armature.bones once out of Edit Mode).
+    _assign_bone_collections(
+        armature_ob.data,
+        [bone.name for bone in cloth.bones if bone.index not in unweighted],
+        placeholder_names,
+    )
 
     armature_ob.show_in_front = True
 

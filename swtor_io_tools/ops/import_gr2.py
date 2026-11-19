@@ -39,6 +39,7 @@ from .import_gr2_armature import build_armature
 from .process_materials import apply_materials_by_name_after_import
 from ..types.gr2 import Granny2
 from ..utils.binary import ArrayBuffer, DataView
+from ..utils.file_browser import is_file_call, remember_folder
 from ..utils.number import decodeHalfFloat
 from ..utils.string import readString
 
@@ -130,6 +131,12 @@ class ImportGR2(Operator):
         default=1.0,
     )
 
+    create_bone_mask_groups: BoolProperty(
+        name="Create Bone Mask Groups",
+        description="Skeletons only. Creates a bone collection for each of the rig's bone masks (the groups of\nbones the game plays part-body animations on, e.g. 'Mask: upperbody').\n\nAll the skeleton's bones are imported either way: this only adds the groups, which are\nuseful for selecting or editing those sets of bones by hand. Animation import doesn't\nneed them: the .jba importer's 'Masked Bones Only' option reads the masks from the\nrig's character specification when the armature has none.\n\nOff: no bone mask groups are created",
+        default=False,
+    )
+
     apply_materials_by_name: BoolProperty(
         name="Apply Materials By Name",
         description="After import, looks up each material's name against a real .mat file in the\nResources Directory (or Legacy Resources Directory) and builds its native SWTOR\nshader automatically.\n\nMaterials with no matching .mat file are left alone, no error -- plenty of\nlegitimate .gr2 materials won't have one.\n\nRequires a Resources Directory to be set in this add-on's Preferences",
@@ -173,16 +180,18 @@ class ImportGR2(Operator):
         self.scale_object           = prefs.gr2_scale_object
         self.scale_factor           = prefs.gr2_scale_factor
         self.apply_materials_by_name = prefs.gr2_apply_materials_by_name_default
+        self.create_bone_mask_groups = prefs.gr2_create_bone_mask_groups
         self.job_results_rich       = False
         self.job_results_accumulate = False
 
         # Handling of filepath in case of being
-        # filled as a param in an external call.
-        if not self.filepath:
-            context.window_manager.fileselect_add(self)
-            return {'RUNNING_MODAL'}
-        else:
-            return self.execute(context)        
+        # filled as a param in an external call. (After an import it holds
+        # just the folder, so the File Browser reopens there: see
+        # remember_folder().)
+        if is_file_call(self.filepath):
+            return self.execute(context)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
 
     def draw(self, context):
@@ -197,8 +206,15 @@ class ImportGR2(Operator):
             body.prop(self, "name_as_filename")
             body.prop(self, "import_collision")
 
-        # Not recommended for modding, so a sub-panel that starts collapsed.
+        # Rarely needed, so a sub-panel that starts collapsed.
         # body is None while the sub-panel is collapsed.
+        header, body = layout.panel("SWTOR_IO_GR2_advanced", default_closed=True)
+        header.label(text="Import Advanced Options")
+        if body:
+            body.prop(self, "create_bone_mask_groups")
+
+        # Not recommended for modding, so a sub-panel that starts collapsed.
+        # Keep this one last.
         header, body = layout.panel("SWTOR_IO_GR2_transform", default_closed=True)
         header.label(text="Import Axis & Scale")
         if body:
@@ -225,13 +241,11 @@ class ImportGR2(Operator):
         if not paths:
             paths.append(self.filepath)
 
-        # Clear filebrowser-related properties now
-        # that they have been read and have no more
-        # use so that they don't persist if the class
-        # breaks before finishing its execution
-        # (it makes debugging difficult, otherwise).
-        self.files.clear()
-        self.filepath = ""
+        # Now that the selection has been read, drop it so that it doesn't
+        # persist if the class breaks before finishing its execution (it makes
+        # debugging difficult, otherwise), but keep the folder: the next File
+        # Browser opens there.
+        remember_folder(self, paths)
 
         print()
 
@@ -783,8 +797,9 @@ def build(gr2,
           scale_factor            = None,
           apply_axis_conversion   = None,
           operator                = None,
+          create_bone_mask_groups = None,
           ):
-    # type: (Granny2, str, bool, bool, bool, float, bool, Optional[Operator]) -> list
+    # type: (Granny2, str, bool, bool, bool, float, bool, Optional[Operator], Optional[bool]) -> list
 
     # Data that will be used for publishing results
     # via scene props to other add-ons
@@ -963,6 +978,7 @@ def build(gr2,
                                      scale_factor          = scale_factor,
                                      apply_axis_conversion = apply_axis_conversion,
                                      operator              = operator,
+                                     create_bone_mask_groups = bool(create_bone_mask_groups),
                                      )
         if armature_ob is not None:
             resulting_single_mesh_blender_objects.append(armature_ob.name)
@@ -1025,6 +1041,7 @@ def load(operator, context, filepath = ""):
                                       scale_factor          = operator.scale_factor,
                                       apply_axis_conversion = operator.apply_axis_conversion,
                                       operator              = operator,
+                                      create_bone_mask_groups = operator.create_bone_mask_groups,
                                       )
             else:
                 # Called via other Import Menu options (such as the
@@ -1039,6 +1056,7 @@ def load(operator, context, filepath = ""):
                                       scale_factor          = prefs.gr2_scale_factor,
                                       apply_axis_conversion = prefs.gr2_apply_axis_conversion,
                                       operator              = operator,
+                                      create_bone_mask_groups = prefs.gr2_create_bone_mask_groups,
                                       )
 
         # Automatic materials-by-name (7a) -- looks up each newly-
