@@ -65,6 +65,7 @@ from .import_gr2 import _MeshCache, _job_results_key
 from .import_gr2 import load as ImportGR2_load
 from .process_materials import apply_materials_by_name_to_gr2_objects, _summarize_and_report
 from ..types.shared import job_results, resolve_resource_path
+from ..utils.file_browser import remember_folder
 
 
 # ---------------------------------------------------------------------------
@@ -772,10 +773,9 @@ class ImportFXSPEC(Operator):
         if not paths:
             paths.append(self.filepath)
 
-        # Clear filebrowser-related properties now that they've been
-        # read -- same reasoning as ImportAREA/ImportGR2's own execute().
-        self.files.clear()
-        self.filepath = ""
+        # Drop the selection now that it's been read, but keep the folder for
+        # the next File Browser -- same as ImportAREA/ImportGR2's own execute().
+        remember_folder(self, paths)
 
         # The active object at invocation time is the CASTER/TARGET
         # bone-lookup source, per the class docstring -- selected BEFORE

@@ -29,6 +29,12 @@ class Prefs(bpy.types.AddonPreferences):
         default=False,
     )
 
+    gr2_create_bone_mask_groups: bpy.props.BoolProperty(
+        name="Create Bone Mask Groups",
+        description="Skeletons only. Creates a bone collection for each of the rig's bone masks (the groups of\nbones the game plays part-body animations on, e.g. 'Mask: upperbody').\n\nAll the skeleton's bones are imported either way: this only adds the groups, which are\nuseful for selecting or editing those sets of bones by hand. Animation import doesn't\nneed them: the .jba importer's 'Masked Bones Only' option reads the masks from the\nrig's character specification when the armature has none.\n\nOff: no bone mask groups are created",
+        default=False,
+    )
+
     gr2_scale_object: bpy.props.BoolProperty(
         name="Scale Object",
         description="Scales imported objects, characters and armatures\nat the Mesh level.\n\nSWTOR sizes objects in decimeters, while Blender defaults to meters.\nThis mismatch, while innocuous, is an obstacle when doing physics\nsimulations, automatic weighting from bones, or other processes\nwhere Blender requires real world-like sizes to succeed",
@@ -101,12 +107,6 @@ class Prefs(bpy.types.AddonPreferences):
     jba_ignore_facial_bones: bpy.props.BoolProperty(
         name="Ignore Facial Transl.",
         description="Ignores the data in the facial bones' translation keyframes\nand only uses their rotation keyframes",
-        default=True,
-    )
-        
-    jba_delete_180: bpy.props.BoolProperty(
-        name="Delete 180º rotation",
-        description="Keeps the animation data from turning the skeleton 180º by deleting\nthe keyframes assigned to the Bip01 bone and setting its rotation to zero.\n\nSWTOR animations turn characters so that they face away from the camera,\nas normally shown in the gameplay. That is not just a nuisance but a problem\nwhen adding cloth or physics simulations to capes or lekku: the instantaneous\nturn plays havok with them",
         default=False,
     )
 
@@ -171,6 +171,7 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.prop(self,'gr2_name_as_filename', text="Name Imported Objects As Filenames")
         boxcol.prop(self,'gr2_apply_axis_conversion', text="'Apply' Axis Conversion")
         boxcol.prop(self,'gr2_apply_materials_by_name_default', text="Apply Materials By Name")
+        boxcol.prop(self,'gr2_create_bone_mask_groups', text="Create Bone Mask Groups (Skeletons)")
         boxcol.prop(self,'gr2_scale_object', text="Scale Imported Objects/Characters")
         slider_split = boxcol.split(factor=0.1)
         slider_split.enabled = self.gr2_scale_object
@@ -181,7 +182,6 @@ class Prefs(bpy.types.AddonPreferences):
         boxcol.label(text=".JBA ANIMATIONS IMPORT SETTINGS:")
         boxcol.scale_y = 0.90
         boxcol.prop(self,'jba_ignore_facial_bones', text="Ignore Facial Bones' Translation Data")
-        boxcol.prop(self,'jba_delete_180')
         boxcol.prop(self,'jba_import_as_nla')
         boxcol.prop(self,'jba_repair_broken_frames')
         boxcol.prop(self,'jba_fit_to_armature')

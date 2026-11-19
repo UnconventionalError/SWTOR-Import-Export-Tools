@@ -9,11 +9,10 @@ Run this script from "File->Import" menu and then load the desired CLO file.
 Module layout
 -------------
 This module holds the registered import operator, the binary .clo reader (shared by
-every build mode), the sibling-mesh lookup (also shared -- Physics mode will need
-it just as much as Rig mode does to find vertex groups/weights to work from), the
-target-armature resolver (``resolve_target_armature``) and the visibility guard
-(``temporarily_visible``). The actual build logic lives in separate modules
-so this one stays a manageable size:
+every build mode), the sibling-mesh lookup (Physics mode needs it just as much as Rig
+mode does to find vertex groups/weights to work from), the target-armature resolver
+(``resolve_target_armature``) and the visibility guard (``temporarily_visible``). The
+actual build logic lives in separate modules so this one stays a manageable size:
 
     import_clo_rig.py         -- "Build Rig": positions a real, posable skeleton from
                                   the cloth bones (this is the mode that's actually
@@ -25,7 +24,6 @@ so this one stays a manageable size:
                                   its own module docstring)
     import_clo_rig_spline.py  -- Spline IK / Bendy Bones layered on top of a built rig
                                   (not yet implemented)
-
 
 
 File format
@@ -45,78 +43,40 @@ Operator
     bl_idname:  ``import_cloth.clo`` (class ``ImportCLO``)
     Menu:       File > Import > Import SWTOR (.clo)
 
-Modes (``mode`` property)
--------------------------
-    'RIG' (default)
-        Builds a posable skeleton from the cloth bones. If an armature is targeted
-        (see "Choosing the target armature"), the bones are merged into it and
-        parented to the matching real skeleton bones (Pelvis, Chest2, Head, ...).
-        Otherwise a standalone armature is created.
-    'PHYSICS'
-        Sets up Cloth Physics on the SELECTED mesh from the .clo's pin, stiffness
-        and gravity data. Does not use ``armature_name``.
+    mode 'RIG' (default) builds a posable skeleton from the cloth bones, merged into
+    a target armature (parented to the matching real bones: Pelvis, Chest2, Head, ...)
+    or, with no target, created as a standalone armature. mode 'PHYSICS' sets up
+    Cloth Physics on the SELECTED mesh and does not use a target armature.
 
 Choosing the target armature (RIG mode)
 ---------------------------------------
-    1. ``armature_name`` property, if non-empty: the armature object with that name.
-       The active object is ignored and nothing needs to be selected. A hidden
-       target (object, collection or view-layer hiding) is revealed for the build
-       and its visibility restored afterwards. If the name is not an armature
-       object in the current scene, the operator reports an error and returns
-       {'CANCELLED'}; it never falls back to another target.
+    1. ``armature_name``, if set: that armature object. The active object is ignored
+       and nothing needs to be selected. A hidden or excluded target is revealed for
+       the build and its visibility restored afterwards. An unknown name, or an
+       object that is not an armature in the current scene, is reported as an error
+       and the import is cancelled before anything is read; there is deliberately
+       NO fallback to another target.
     2. Otherwise, the active object, if it is an armature.
     3. Otherwise, a new standalone armature is created.
 
-Operator properties
--------------------
-    filepath, directory, files   File(s) to import. Several files in one call are
-                                 imported in order, all into the same target.
-    mode                         'RIG' or 'PHYSICS' (see above).
-    armature_name                Target armature object name (see above).
-                                 Not remembered between calls.
-    skip_unweighted_bones        RIG: omit bones with no weight on the matching
-                                 mesh (the object named after the .clo's base file
-                                 name), reparenting their children upward.
-    add_master_bone              RIG, standalone armature only: add one parent bone
-                                 above the placeholders.
-    physics_auto_fix_floating_islands
-                                 PHYSICS: force-pin disconnected mesh islands that
-                                 have real bone weights to fall back on.
-    use_spline_ik, use_bendy_bones, add_curve_hooks, preserve_bone_length
-                                 RIG: reserved for import_clo_rig_spline.py; not yet
-                                 implemented.
+Scripted use
+------------
+    With ``armature_name`` and a file path (or ``files``) set, the file browser is
+    skipped and nothing needs to be selected. Several files in one call are imported
+    in order, all into the same target::
 
-Usage from the UI
------------------
-    Select the target armature (RIG) or mesh (PHYSICS), then File > Import >
-    Import SWTOR (.clo), pick the file and set the options.
+        try:
+            bpy.ops.import_cloth.clo(
+                filepath="/path/to/chest_cape.clo",
+                mode='RIG',
+                armature_name="my_armature",   # Object name, not the armature data name.
+            )
+        except RuntimeError as err:
+            ...  # Reported errors (e.g. unknown armature) surface as a RuntimeError.
 
-Usage from another add-on or script
------------------------------------
-    The file browser is skipped when ``armature_name`` and ``filepath`` (or
-    ``files``) are both set, whichever execution context is used::
-
-        import bpy
-
-        result = bpy.ops.import_cloth.clo(
-            filepath="/path/to/chest_cape.clo",
-            mode='RIG',
-            armature_name="my_armature",   # Object name, not the armature data name.
-            skip_unweighted_bones=True,
-        )
-        if result != {'FINISHED'}:
-            ...  # Error text was sent through the operator's report().
-
-    Notes:
-        - ``bpy.ops`` polling applies: call from a context with a 3D Viewport and
-          Object mode available (such as an add-on living in the 3D View's Sidebar),
-          or wrap the call in ``context.temp_override()`` (e.g. from timers and handlers).
-        - Failures are reported with ``report({'ERROR'}, ...)``; from Python these
-          surface as a RuntimeError when the operator is run with 'EXEC_DEFAULT'
-          and an ERROR report, so wrap the call in try/except if needed.
-        - The operator registers an undo step ({'UNDO'}).
-
-
+    ``bpy.ops`` polling applies: call from a context with a 3D Viewport in Object
+    mode (such as an add-on living in the 3D View's sidebar), or wrap the call in
+    ``context.temp_override()`` (timers, handlers). The operator registers an undo step.
 """
 
 import os
@@ -134,26 +94,9 @@ from ..utils.binary import ArrayBuffer, DataView
 
 class ImportCLO(Operator, ImportHelper):
     """
-    Import a SWTOR cloth physics file (.clo) as a skeleton or as Cloth Physics.
-
-    Call as ``bpy.ops.import_cloth.clo(...)``. See the module docstring for the full
-    property list and examples.
-
-    RIG mode adds the cloth bones to a target armature chosen by, in order: the
-    ``armature_name`` property, the active armature, or a new standalone armature.
-    PHYSICS mode configures Cloth Physics on the selected mesh.
-
-    Scripted use (no pre-selection, no file browser)::
-
-        bpy.ops.import_cloth.clo(
-            filepath="/path/to/file.clo",
-            mode='RIG',
-            armature_name="my_armature",
-        )
-
-    Returns {'FINISHED'} on success, {'CANCELLED'} on failure (reason reported via
-    ``report()``). A hidden target armature is revealed during the build and restored
-    afterwards.
+    Import a SWTOR cloth physics file (.clo) as a skeleton (RIG) or as Cloth Physics
+    (PHYSICS). Scripts can pass ``armature_name`` to target an armature without
+    selecting it; see the module docstring.
     """
     bl_idname = "import_cloth.clo"
     bl_label = "Import SWTOR (.clo)"
@@ -202,7 +145,8 @@ class ImportCLO(Operator, ImportHelper):
     )
     skip_unweighted_bones: BoolProperty(
         name="Skip Unweighted Bones",
-        description="Leave out bones with no weight on the matching mesh (reparenting their children up a level)",
+        description=("Leave out bones nothing on the matching mesh depends on: no weight of their own and no\n"
+                     "weighted bones beneath them (the children of a skipped bone are reparented up a level)"),
         default=True,
     )
     use_spline_ik: BoolProperty(
@@ -302,6 +246,13 @@ class ImportCLO(Operator, ImportHelper):
 
     def execute(self, context):
         # type: (Context) -> Set[str]
+        # Soft-fail up front: a bad armature_name is reported once and nothing is
+        # parsed or modified (rather than failing once per file inside build()).
+        if self.mode == 'RIG' and self.armature_name:
+            _, resolved = resolve_target_armature(self, context)
+            if not resolved:
+                return {'CANCELLED'}
+
         paths = [os.path.join(self.directory, file.name) for file in self.files]
 
         if not paths:
@@ -349,9 +300,27 @@ def _fix_crlf_if_needed(raw):
 
 def read(operator, filepath):
     # type: (Operator, str) -> Optional[Cloth]
-    with open(filepath, 'rb') as file:
-        raw = file.read()
+    """
+    Reads a .clo file. Anything wrong with the file (missing, unreadable, not a .clo,
+    truncated) is reported as an error and gives None, never an exception.
+    """
+    try:
+        with open(filepath, 'rb') as file:
+            raw = file.read()
+    except OSError as err:
+        operator.report({'ERROR'}, f"\'{filepath}\' could not be read: {err.strerror or err}.")
+        return None
 
+    try:
+        return _parse(operator, filepath, raw)
+    except IndexError:
+        # The DataView raises this for any read past the end of the file.
+        operator.report({'ERROR'}, f"\'{filepath}\' is truncated or damaged.")
+        return None
+
+
+def _parse(operator, filepath, raw):
+    # type: (Operator, str, bytes) -> Optional[Cloth]
     raw = _fix_crlf_if_needed(raw)
 
     buffer = ArrayBuffer(len(raw))
@@ -532,47 +501,22 @@ def _find_sibling_mesh(filepath):
     return mesh_ob if (mesh_ob is not None and mesh_ob.type == 'MESH') else None
 
 
-def _find_layer_collection_paths(layer_collection, collection_set, path=()):
-    # type: (object, set, tuple) -> List[tuple]
-    """
-    Depth-first search of the view layer's LayerCollection tree.
-    
-    (Support function for processing target armatures fed via 'armature_name' param
-     that happen to be excluded from the Viewlayer: their Collection is unticked)
-
-    :param layer_collection: LayerCollection to start from (usually the root).
-    :param collection_set: Set of ``bpy.types.Collection`` that directly contain the object.
-    :param path: LayerCollections already traversed (outermost first); internal.
-    :return: One tuple per matching LayerCollection, listing every LayerCollection
-        from the first child of the root down to the match (outermost first). Every
-        entry in such a path can hide the object, so every entry must be revealed.
-    """
-    paths = []
-    for child in layer_collection.children:
-        child_path = path + (child,)
-        if child.collection in collection_set:
-            paths.append(child_path)
-        paths.extend(_find_layer_collection_paths(child, collection_set, child_path))
-    return paths
-
-
 @contextmanager
 def temporarily_visible(context, object_name):
     # type: (Context, str) -> Iterator[None]
     """
-    Context manager: guarantee an object is visible and selectable inside the block,
-    then put every visibility flag back exactly as it was (even if the block raises).
-    
-    (Support function for processing target armatures fed via 'armature_name' param
-     that happen to be hidden: their eye button is closed)
+    Context manager: make an object usable (selectable, enterable in Edit Mode) inside
+    the block, then put everything back exactly as it was, even if the block raises.
 
+    (Support function for target armatures fed via the ``armature_name`` property that
+     happen to be hidden or sit in an excluded collection.)
 
-    Handles every mechanism that makes ``select_set()`` / ``mode_set()`` fail:
-        - Object ``hide_viewport`` (monitor icon) and ``hide_select`` (arrow icon)
-        - Object ``hide_get()`` (eye icon / H key; per view layer)
-        - On every collection containing the object AND each of its ancestors in the
-          view layer: ``LayerCollection.exclude`` (checkbox), ``LayerCollection.hide_viewport``
-          (eye), ``Collection.hide_viewport`` (monitor) and ``Collection.hide_select``
+    Collection-level hiding is bypassed rather than undone: the object is linked into
+    the scene's master collection for the duration, which can't be excluded or hidden,
+    so the object's real collections are never touched (and none of their other
+    objects pop into view). Only the object's own flags are changed and restored:
+    ``hide_viewport`` (monitor icon), ``hide_select`` (arrow icon) and ``hide_get()``
+    (eye icon / H key; per view layer).
 
     It silently does nothing when the name is empty, unknown, or the object is not
     linked into the current scene; ``resolve_target_armature()`` reports those cases.
@@ -589,33 +533,24 @@ def temporarily_visible(context, object_name):
         return
 
     view_layer = context.view_layer
+    scene_root = context.scene.collection
 
-    # NOTE: Snapshot, then reveal. Collections go first (outermost to innermost),
-    # because an object inside an excluded collection is not in the view layer at all
-    # and cannot be queried or hidden/shown until the collection is re-included.
-    # Must be captured BEFORE un-excluding collections, or it is always True.
+    # NOTE: Collection/flag changes made through the API only reach the view layer at
+    # its next sync, so sync first, or a freshly excluded collection reads as visible.
+    view_layer.update()
+
+    # Snapshot BEFORE touching anything. hide_get() is only meaningful if the object
+    # was in the view layer originally (an excluded one has no base to ask).
     was_in_view_layer = ob.name in view_layer.objects
-
-    layer_collections = []  # type: List[object]
-    for path in _find_layer_collection_paths(view_layer.layer_collection, set(ob.users_collection)):
-        for layer_collection in path:
-            if layer_collection not in layer_collections:
-                layer_collections.append(layer_collection)
-
-    collection_states = []
-    for lc in layer_collections:
-        collection_states.append((lc, lc.exclude, lc.hide_viewport,
-                                  lc.collection.hide_viewport, lc.collection.hide_select))
-        lc.exclude = False
-        lc.hide_viewport = False
-        lc.collection.hide_viewport = False
-        lc.collection.hide_select = False
-
-    # hide_get() is only meaningful if the object was in the view layer originally; a
-    # freshly re-included object reports default visibility, not a remembered state.
     orig_hide_get = ob.hide_get(view_layer=view_layer) if was_in_view_layer else None
     orig_hide_viewport = ob.hide_viewport
     orig_hide_select = ob.hide_select
+    orig_mode = ob.mode
+
+    linked_to_root = ob.name not in scene_root.objects
+    if linked_to_root:
+        scene_root.objects.link(ob)
+        view_layer.update()  # The object only joins the view layer once this syncs.
 
     ob.hide_viewport = False
     ob.hide_select = False
@@ -625,10 +560,12 @@ def temporarily_visible(context, object_name):
     try:
         yield
     finally:
-        # NOTE: Restore in reverse order. Leave Edit/Pose mode first: hiding an
-        # object that is still in an interactive mode leaves Blender in a bad state.
-        if context.mode != 'OBJECT' and bpy.ops.object.mode_set.poll():
-            bpy.ops.object.mode_set(mode='OBJECT')
+        # NOTE: Restore in reverse order. If the build died inside Edit Mode, leave it
+        # first: hiding an object that is still in an interactive mode leaves Blender
+        # in a bad state. A mode the object was already in is left alone.
+        if ob.mode == 'EDIT' and orig_mode != 'EDIT':
+            if view_layer.objects.active is ob and bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
 
         # Object flags first, while the object is still guaranteed to be in the view layer.
         if orig_hide_get is not None and ob.name in view_layer.objects:
@@ -636,11 +573,8 @@ def temporarily_visible(context, object_name):
         ob.hide_select = orig_hide_select
         ob.hide_viewport = orig_hide_viewport
 
-        for lc, exclude, hide_viewport, coll_hide_viewport, coll_hide_select in reversed(collection_states):
-            lc.collection.hide_select = coll_hide_select
-            lc.collection.hide_viewport = coll_hide_viewport
-            lc.hide_viewport = hide_viewport
-            lc.exclude = exclude  # Last: excluding removes the object from the view layer.
+        if linked_to_root and ob.name in scene_root.objects:
+            scene_root.objects.unlink(ob)  # Last: for an excluded object this removes it from the view layer.
 
 
 def resolve_target_armature(operator, context):
@@ -649,9 +583,9 @@ def resolve_target_armature(operator, context):
     Determine which armature the cloth bones should be merged into.
 
     Resolution order:
-        1. ``operator.armature_name``, if set. It must name an armature object that
-           is in the current view layer. Hidden objects are fine: ``load()`` reveals
-           them for the duration of the build via ``temporarily_visible()``. If the
+        1. ``operator.armature_name``, if set. It must name an armature object linked
+           into the current scene. Hidden or excluded objects are fine:
+           ``load()`` reveals them for the build via ``temporarily_visible()``. If the
            name is invalid an error is reported and the lookup fails (there is
            deliberately NO fallback to the active object or to a standalone armature,
            since the caller asked for a specific target).
@@ -662,7 +596,8 @@ def resolve_target_armature(operator, context):
         operators without the property are handled).
     :param context: The current Blender context.
     :return: ``(armature_or_None, ok)``. ``ok`` is False when an explicitly
-        requested armature could not be used; the caller should abort.
+        requested armature could not be used (the reason is already reported); the
+        caller should abort.
     """
     import bpy
 
@@ -670,12 +605,14 @@ def resolve_target_armature(operator, context):
     if name:
         armature_ob = bpy.data.objects.get(name)
         if armature_ob is None or armature_ob.type != 'ARMATURE':
-            operator.report({'ERROR'}, f"Target armature \'{name}\' not found, or it is not an armature object.")
+            available = sorted(ob.name for ob in context.scene.objects if ob.type == 'ARMATURE')
+            hint = f" Armatures in this scene: {', '.join(available)}." if available else " There are no armatures in this scene."
+            operator.report({'ERROR'}, f"Target armature '{name}' not found, or it is not an armature object.{hint}")
             return None, False
-        # Still absent from the view layer after temporarily_visible() ran means it is
-        # not linked into the current scene, which cannot be worked around.
-        if armature_ob.name not in context.view_layer.objects:
-            operator.report({'ERROR'}, f"Target armature \'{name}\' is not in the current scene.")
+        # Hidden or excluded is fine (see above), but an object that isn't linked into
+        # this scene at all can't be worked on from it.
+        if armature_ob.name not in context.scene.objects:
+            operator.report({'ERROR'}, f"Target armature '{name}' is not in the current scene.")
             return None, False
         return armature_ob, True
 
@@ -700,14 +637,14 @@ def load(operator, context, filepath=""):
 
         progress.step("Building ...", 2)
 
-        # NOTE: Reveal a hidden target armature for the build only; flags are restored
-        # afterwards even if the build raises. No-op when armature_name is empty.
-        with temporarily_visible(context, getattr(operator, "armature_name", "")):
-            if getattr(operator, "mode", 'RIG') == 'PHYSICS':
-                from . import import_clo_physics
-                built = import_clo_physics.build(operator, context, cloth, filepath)
-            else:
-                from . import import_clo_rig
+        if getattr(operator, "mode", 'RIG') == 'PHYSICS':
+            from . import import_clo_physics
+            built = import_clo_physics.build(operator, context, cloth, filepath)
+        else:
+            from . import import_clo_rig
+            # NOTE: Reveal a hidden target armature for the build only; its state is
+            # restored afterwards even if the build raises. No-op when armature_name is empty.
+            with temporarily_visible(context, getattr(operator, "armature_name", "")):
                 built = import_clo_rig.build(operator, context, cloth, filepath)
 
         if built:

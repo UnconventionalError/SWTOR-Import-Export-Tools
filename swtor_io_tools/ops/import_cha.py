@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import bpy
-import bmesh
-from mathutils import Vector, Matrix
 
 from .import_gr2 import load as ImportGR2_load
 from .material_builder import get_or_create_material, is_head_object_name
@@ -637,7 +635,7 @@ def assemble_collections(context, npc_name, slot_objects, skeleton_ob=None, char
 
 
 # ---------------------------------------------------------------------------
-# Twi'lek eyes UV fix + eye separation (spec §9, ported from ZG_Tools)
+# Twi'lek eyes UV fix (spec §9, ported from ZG_Tools)
 # ---------------------------------------------------------------------------
 
 def translate_uv_coordinates(mesh_object, material_slot=None, uv_offset=(0, 0)):
@@ -667,212 +665,6 @@ def translate_uv_coordinates(mesh_object, material_slot=None, uv_offset=(0, 0)):
                 uv.y += uv_offset[1]
 
 
-def duplicate_obj(obj_or_obj_name):
-    """
-    Creates a full duplicate of an object (mesh data, transforms,
-    modifiers, constraints, animation data, custom properties), linked
-    into the same Collection(s) as the original.
-
-    Ported unchanged from the original ZG_Tools assembler.
-    """
-    if isinstance(obj_or_obj_name, str):
-        obj = bpy.data.objects[obj_or_obj_name]
-    else:
-        obj = obj_or_obj_name
-
-    new_data = obj.data.copy()
-    new_obj = bpy.data.objects.new(obj.name + ".copy", new_data)
-
-    for col in obj.users_collection:
-        col.objects.link(new_obj)
-
-    new_obj.location = obj.location.copy()
-    new_obj.rotation_euler = obj.rotation_euler.copy()
-    new_obj.rotation_quaternion = obj.rotation_quaternion.copy()
-    new_obj.scale = obj.scale.copy()
-    new_obj.data = new_data
-
-    for prop in obj.keys():
-        if prop != "_RNA_UI":
-            new_obj[prop] = obj[prop]
-
-    for mod in obj.modifiers:
-        new_mod = new_obj.modifiers.new(name=mod.name, type=mod.type)
-        for attr in dir(mod):
-            if not attr.startswith("_") and attr not in {"type", "name", "rna_type"}:
-                try:
-                    setattr(new_mod, attr, getattr(mod, attr))
-                except AttributeError:
-                    pass
-
-        if mod.type == 'ARMATURE':
-            new_mod.object = mod.object
-
-    if obj.animation_data:
-        new_obj.animation_data_create()
-        new_obj.animation_data.action = obj.animation_data.action
-        new_obj.animation_data.action = obj.animation_data.action.copy()
-
-    for constr in obj.constraints:
-        new_constr = new_obj.constraints.new(type=constr.type)
-        for attr in dir(constr):
-            if not attr.startswith("_") and attr not in {"type", "name", "rna_type"}:
-                try:
-                    setattr(new_constr, attr, getattr(constr, attr))
-                except AttributeError:
-                    pass
-
-    return new_obj
-
-
-def separate_obj_by_specific_materials(obj_or_obj_name, material_names, separate=True):
-    """
-    Separates an object's polys associated with the given material(s)
-    into a new object per material. By default, also deletes those
-    polys and material slots from the original object.
-
-    :param material_names: a material name, or a list of material names.
-
-    Ported from the original ZG_Tools assembler, with one clarity fix:
-    the original accepted a single material name string and tested
-    membership via Python's substring-`in` on that string, despite its
-    own docstring describing it as "a list of materials names" --
-    happened to work for how it was actually called (the exact same
-    string on both sides of `in`), but is genuinely a list-membership
-    check now, matching the docstring.
-    """
-    if isinstance(material_names, str):
-        material_names = [material_names]
-
-    if isinstance(obj_or_obj_name, str):
-        original_obj = bpy.data.objects[obj_or_obj_name]
-    else:
-        original_obj = obj_or_obj_name
-
-    original_mesh = original_obj.data
-    new_objs = []
-
-    mat_indices = [
-        i for i, mat in enumerate(original_mesh.materials) if mat.name in material_names
-    ]
-
-    if separate:
-        for mat_index in mat_indices:
-            new_obj = original_obj.copy()
-            new_obj.data = original_obj.data.copy()
-            bpy.context.collection.objects.link(new_obj)
-            new_obj.name = "%s_%s" % (original_obj.name, original_mesh.materials[mat_index].name)
-
-            bm = bmesh.new()
-            bm.from_mesh(new_obj.data)
-            faces_to_delete = [f for f in bm.faces if f.material_index != mat_index]
-            bmesh.ops.delete(bm, geom=faces_to_delete, context='FACES')
-            bm.to_mesh(new_obj.data)
-            bm.free()
-
-            new_objs.append(new_obj)
-
-    bm = bmesh.new()
-    bm.from_mesh(original_mesh)
-    faces_to_delete = [f for f in bm.faces if f.material_index in mat_indices]
-    bmesh.ops.delete(bm, geom=faces_to_delete, context='FACES')
-    bm.to_mesh(original_mesh)
-    bm.free()
-
-    for i, slot in enumerate(original_obj.material_slots[:]):
-        if slot.material and slot.material.name in material_names:
-            original_obj.data.materials.pop(index=i)
-
-    return new_objs
-
-
-def delete_polygons_on_side(obj_or_obj_name, side='LEFT'):
-    """
-    Deletes every polygon on the given side of local X == 0.
-
-    Ported unchanged from the original ZG_Tools assembler.
-    """
-    if isinstance(obj_or_obj_name, str):
-        obj = bpy.data.objects[obj_or_obj_name]
-    else:
-        obj = obj_or_obj_name
-
-    if obj.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-    mesh = obj.data
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-
-    faces_to_delete = []
-    for face in bm.faces:
-        center = face.calc_center_median()
-        if side == 'LEFT' and center.x < 0:
-            faces_to_delete.append(face)
-        elif side == 'RIGHT' and center.x >= 0:
-            faces_to_delete.append(face)
-
-    bmesh.ops.delete(bm, geom=faces_to_delete, context='FACES')
-    bm.to_mesh(mesh)
-    bm.free()
-
-
-def get_highest_and_lowest_vertices(obj_or_obj_name):
-    """
-    Returns (highest_vertex, lowest_vertex) world-space coordinates by Z.
-
-    Ported unchanged from the original ZG_Tools assembler.
-    """
-    if isinstance(obj_or_obj_name, str):
-        obj = bpy.data.objects[obj_or_obj_name]
-    else:
-        obj = obj_or_obj_name
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    bm = bmesh.new()
-    bm.from_mesh(obj.data)
-
-    global_matrix = obj.matrix_world
-    highest_vertex = None
-    lowest_vertex = None
-
-    for v in bm.verts:
-        global_coord = global_matrix @ v.co
-        if highest_vertex is None or global_coord.z > highest_vertex.z:
-            highest_vertex = global_coord
-        if lowest_vertex is None or global_coord.z < lowest_vertex.z:
-            lowest_vertex = global_coord
-
-    bm.free()
-
-    return highest_vertex, lowest_vertex
-
-
-def set_obj_origin(obj_or_obj_name, new_origin):
-    """
-    Moves an object's origin to new_origin (world space), preserving its
-    visual position by compensating the mesh data's transform.
-
-    Ported unchanged from the original ZG_Tools assembler.
-    """
-    if isinstance(obj_or_obj_name, str):
-        obj = bpy.data.objects[obj_or_obj_name]
-    else:
-        obj = obj_or_obj_name
-
-    new_origin = Vector(new_origin)
-
-    obj_matrix = obj.matrix_world
-    current_origin_world = obj_matrix @ Vector((0, 0, 0))
-    delta_world = new_origin - current_origin_world
-    delta_object_space = obj_matrix.inverted() @ delta_world
-
-    obj.location += delta_world
-    obj.data.transform(Matrix.Translation(-delta_object_space))
-    obj.data.update()
-
-
 def apply_twilek_eyes_uv_fix(slot_objects):
     # type: (Dict[str, List[Any]]) -> None
     """
@@ -887,63 +679,6 @@ def apply_twilek_eyes_uv_fix(slot_objects):
     for head_ob in slot_objects.get("head", []):
         if "head_twilek" in head_ob.name:
             translate_uv_coordinates(head_ob, 1, (0, -2))
-
-
-def separate_head_eyes(slot_objects, separate_each_eye):
-    # type: (Dict[str, List[Any]], bool) -> None
-    """
-    For every head object with an Eye material in its 2nd material slot,
-    splits the eyes out into their own object (or two objects, one per
-    eye, if separate_each_eye is set) and appends them into
-    slot_objects["head"] so they end up correctly placed by
-    assemble_collections().
-
-    Iterates over a snapshot of slot_objects["head"] rather than the
-    live list, since new eye objects get appended into that same list
-    as this runs.
-    """
-    for head_ob in list(slot_objects.get("head", [])):
-        if len(head_ob.material_slots) <= 1:
-            continue
-        if "eye" not in head_ob.material_slots[1].name.lower():
-            continue
-
-        eyes_ob = duplicate_obj(head_ob)
-
-        # Delete the eyes' polys/material from the head object, and the
-        # head's polys/material from the eyes object (the duplicate).
-        separate_obj_by_specific_materials(
-            head_ob, head_ob.material_slots[1].name, separate=False,
-        )
-        separate_obj_by_specific_materials(
-            eyes_ob, eyes_ob.material_slots[0].name, separate=False,
-        )
-
-        if not separate_each_eye:
-            eyes_ob.name = "%s.eyes" % head_ob.name
-            slot_objects.setdefault("head", []).append(eyes_ob)
-            continue
-
-        eyes_ob_right = eyes_ob
-        eyes_ob_left = duplicate_obj(eyes_ob)
-
-        delete_polygons_on_side(eyes_ob_right, side='LEFT')
-        highest_vertex, lowest_vertex = get_highest_and_lowest_vertices(eyes_ob_right)
-        set_obj_origin(
-            eyes_ob_right,
-            (highest_vertex.x, highest_vertex.y, (highest_vertex.z + lowest_vertex.z) / 2),
-        )
-        eyes_ob_right.name = "%s.eyes.right" % head_ob.name
-        slot_objects.setdefault("head", []).append(eyes_ob_right)
-
-        delete_polygons_on_side(eyes_ob_left, side='RIGHT')
-        highest_vertex, lowest_vertex = get_highest_and_lowest_vertices(eyes_ob_left)
-        set_obj_origin(
-            eyes_ob_left,
-            (highest_vertex.x, highest_vertex.y, (highest_vertex.z + lowest_vertex.z) / 2),
-        )
-        eyes_ob_left.name = "%s.eyes.left" % head_ob.name
-        slot_objects.setdefault("head", []).append(eyes_ob_left)
 
 
 # ---------------------------------------------------------------------------
@@ -1024,9 +759,6 @@ def load(operator, context, filepath=""):
 
     if operator.correct_twilek_eyes_uv:
         apply_twilek_eyes_uv_fix(slot_objects)
-
-    if operator.separate_eyes:
-        separate_head_eyes(slot_objects, operator.separate_each_eye)
 
     assemble_collections(
         context,
@@ -1161,21 +893,6 @@ class ImportCHA(bpy.types.Operator):
         default=True,
     )
 
-    separate_eyes: bpy.props.BoolProperty(
-        name="Separate Eyes",
-        description="Separates the eyes from the head object into their own object, useful for rigging",
-        default=False,
-    )
-
-    separate_each_eye: bpy.props.BoolProperty(
-        name="Separate Eyes Individually",
-        description=(
-        "When separating eyes, makes each eye its own object with its own origin.\n\n"
-        "Requires \"Separate Eyes\" to be enabled as well."
-        ),
-        default=False,
-    )
-
     job_results_rich: bpy.props.BoolProperty(
         name="Rich Results Info",
         options={'HIDDEN'},
@@ -1227,8 +944,6 @@ class ImportCHA(bpy.types.Operator):
         if body:
             body.prop(self, "import_skeleton")
             body.prop(self, "bind_to_skeleton")
-            body.prop(self, "separate_eyes")
-            body.prop(self, "separate_each_eye")
 
 
     def execute(self, context):
